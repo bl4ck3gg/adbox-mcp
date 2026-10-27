@@ -14,3 +14,4 @@
 # Framework classes are provided by the platform, never bundled.
 -dontwarn android.**
 -dontwarn androidx.**
+

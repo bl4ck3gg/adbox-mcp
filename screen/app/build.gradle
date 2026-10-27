@@ -1,0 +1,36 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace "mr.robot.agent"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "mr.robot.agent"
+        minSdk 21
+        targetSdk 35
+        versionCode 1
+        versionName "2.4"
+    }
+
+    buildFeatures {
+        buildConfig = true
+        aidl = true
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {}

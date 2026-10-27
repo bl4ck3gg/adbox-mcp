@@ -78,3 +78,14 @@ func (m *Manager) AutoRestart(dev *adb.Device, serial string, opts Options) (str
 	}
 	return m.Start(dev, serial, opts)
 }
+
+// List returns a snapshot of all active sessions.
+func (m *Manager) List() []*Session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		res = append(res, s)
+	}
+	return res
+}

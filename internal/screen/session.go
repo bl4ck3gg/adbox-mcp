@@ -954,3 +954,8 @@ func (s *Session) notifyEnded(reason string) {
 
 // Running reports whether the session is still alive on the device side.
 func (s *Session) Running() bool { return s.running.Load() }
+
+// Port returns the viewer's bound HTTP port, or 0 if not listening yet.
+func (s *Session) Port() int {
+	return s.httpPort
+}

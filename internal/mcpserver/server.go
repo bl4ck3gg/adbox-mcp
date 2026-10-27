@@ -29,6 +29,10 @@ import (
 	"adbox-mcp/internal/tasks"
 	"adbox-mcp/internal/screen"
 	"adbox-mcp/internal/tether"
+	"net"
+	"os"
+	"strconv"
+	"log/slog"
 )
 
 type Server struct {
@@ -36,6 +40,7 @@ type Server struct {
 	tasks  *tasks.Registry
 	tether *tether.Manager
 	screen *screen.Manager
+	portal *screen.Portal
 }
 
 func New(mgr *endpoint.Manager) *Server {
@@ -49,9 +54,62 @@ func New(mgr *endpoint.Manager) *Server {
 
 // Run serves MCP over stdio until the context is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	s.startPortal()
+
 	srv := mcp.NewServer(&mcp.Implementation{Name: "adbox", Version: "0.1.0"}, nil)
 	s.registerTools(srv)
-	return srv.Run(ctx, &mcp.StdioTransport{})
+	err := srv.Run(ctx, &mcp.StdioTransport{})
+	if s.portal != nil {
+		s.portal.Close()
+	}
+	return err
+}
+
+// startPortal brings up the device list. It is best effort: a portal that cannot
+// bind must not stop the MCP server, because the tools work without one and a
+// caller who only ever uses screen_start's own URL never needs it.
+func (s *Server) startPortal() {
+	host := os.Getenv("ADBOX_SCREEN_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := 0
+	if raw := strings.TrimSpace(os.Getenv("ADBOX_PORTAL_PORT")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			port = n
+		}
+	}
+	p := screen.NewPortal(s.screen, host, port)
+	url, err := p.Start()
+	if err != nil {
+		slog.Warn("portal did not start; device_screen_start still returns a per-device URL", "err", err)
+		return
+	}
+	s.portal = p
+	_ = url // already logged by Portal.Start, with the address it actually bound
+}
+
+// PortalURL is the device list address, or "" when no portal is running.
+func (s *Server) PortalURL() string {
+	if s.portal == nil {
+		return ""
+	}
+	addr := s.portal.Addr()
+	if addr == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return "http://" + host + ":" + port + "/"
 }
 
 func textResult(v any) (*mcp.CallToolResult, error) {

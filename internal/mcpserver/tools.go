@@ -128,6 +128,9 @@ func (s *Server) registerTools(srv *mcp.Server) {
 			res["height"] = sess.Height()
 			res["frame_rate"] = 30
 			res["note"] = "WebSocket endpoint at /ws; open the URL in a Chromium browser"
+			if portal := s.PortalURL(); portal != "" {
+				res["portal_url"] = portal
+			}
 		}
 		return textResult(res)
 	})

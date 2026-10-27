@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,8 +48,6 @@ type Session struct {
 	controlConn   atomic.Pointer[net.Conn]
 	lastClipboard atomic.Pointer[string]
 	clipSeq       atomic.Uint64
-	httpListener  net.Listener
-	httpPort      int
 }
 
 var (
@@ -313,44 +310,21 @@ func (s *Session) Start() (webUrl string, err error) {
 		_, _ = control.Write([]byte{18, 1})
 	}
 
-	// 9. Start HTTP viewer server
-	bindHost := os.Getenv("ADBOX_SCREEN_HOST")
-	if bindHost == "" {
-		bindHost = "127.0.0.1"
-	}
-	portSpec := "0"
-	if s.viewerPort > 0 {
-		portSpec = strconv.Itoa(s.viewerPort)
-	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(bindHost, portSpec))
-	if err != nil {
-		_ = videoConn.Close()
-		if cc := s.controlConn.Load(); cc != nil {
-			_ = (*cc).Close()
-		}
-		s.hub.Stop()
-		return "", fmt.Errorf("listen viewer: %w", err)
-	}
-	s.httpListener = ln
-	s.httpPort = ln.Addr().(*net.TCPAddr).Port
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
-	mux.HandleFunc("/ws", s.handleWS)
-	go http.Serve(ln, mux)
-
-	webUrl = fmt.Sprintf("http://%s:%d/", bindHost, s.httpPort)
-	slog.Info("screen session started", "device", s.serial, "web", webUrl, "fwd", fwdPort)
-	return webUrl, nil
+	// 9. No listener of its own.
+	//
+	// ONE PORT, MANY DEVICES. A listener per session means a port per phone, and a
+	// port that changes on every restart is a number nobody can keep. The gateway
+	// (portal.go) is the only listener; it routes /device/<serial>/ to handleIndex
+	// and /device/<serial>/ws to handleWS on this session, in this process. Nothing
+	// is proxied over a socket, so a viewer costs one goroutine and no port.
+	slog.Info("screen session started", "device", s.serial, "fwd", fwdPort)
+	return "", nil
 }
 
 func (s *Session) Close() {
 	s.running.Store(false)
 	s.hub.Stop()
 
-	if s.httpListener != nil {
-		_ = s.httpListener.Close()
-	}
 	if c := s.controlConn.Load(); c != nil {
 		_ = (*c).Close()
 	}
@@ -955,7 +929,12 @@ func (s *Session) notifyEnded(reason string) {
 // Running reports whether the session is still alive on the device side.
 func (s *Session) Running() bool { return s.running.Load() }
 
-// Port returns the viewer's bound HTTP port, or 0 if not listening yet.
-func (s *Session) Port() int {
-	return s.httpPort
+// ServeHTTP renders the device's control page.
+func (s *Session) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handleIndex(w, r)
+}
+
+// ServeWS upgrades the connection and starts streaming video/audio and reading input.
+func (s *Session) ServeWS(w http.ResponseWriter, r *http.Request) {
+	s.handleWS(w, r)
 }

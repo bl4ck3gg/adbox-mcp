@@ -79,6 +79,8 @@ const indexHtml = `<!DOCTYPE html>
 </head>
 <body>
 <div id="rail">
+  <a href="/" data-tip="Device portal" style="text-decoration:none;display:flex;align-items:center;justify-content:center;color:inherit;font-size:15px;width:34px;height:34px;border-radius:6px;background:#202025;">⊞</a>
+  <div class="sep"></div>
   <button data-tip="Back"            data-key="4">◀</button>
   <button data-tip="Home"            data-key="3">●</button>
   <button data-tip="Recents"         data-key="187">■</button>
@@ -237,7 +239,8 @@ function handleAudio(data) {
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/ws');
+  const base = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
+  ws = new WebSocket(proto + '//' + location.host + base + 'ws' + location.search);
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => setStatus('live', '');

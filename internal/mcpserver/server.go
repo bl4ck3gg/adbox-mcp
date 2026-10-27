@@ -29,7 +29,6 @@ import (
 	"adbox-mcp/internal/tasks"
 	"adbox-mcp/internal/screen"
 	"adbox-mcp/internal/tether"
-	"net"
 	"os"
 	"strconv"
 	"log/slog"
@@ -79,37 +78,35 @@ func (s *Server) startPortal() {
 			port = n
 		}
 	}
-	p := screen.NewPortal(s.screen, host, port)
+	token := strings.TrimSpace(os.Getenv("ADBOX_TOKEN"))
+	if token == "" && os.Getenv("ADBOX_NO_AUTH") != "1" {
+		token = screen.NewToken()
+	}
+	p := screen.NewPortal(s.screen, host, port, token)
 	url, err := p.Start()
 	if err != nil {
-		slog.Warn("portal did not start; device_screen_start still returns a per-device URL", "err", err)
+		slog.Warn("portal did not start", "err", err)
 		return
 	}
 	s.portal = p
-	_ = url // already logged by Portal.Start, with the address it actually bound
+	slog.Info("portal ready", "url", url)
 }
 
-// PortalURL is the device list address, or "" when no portal is running.
+// PortalURL returns the base URL with auth token query appended.
 func (s *Server) PortalURL() string {
 	if s.portal == nil {
 		return ""
 	}
-	addr := s.portal.Addr()
-	if addr == "" {
+	return s.portal.URL()
+}
+
+// DeviceURL returns http://host:port/device/<serial>/?token=...
+func (s *Server) DeviceURL(serial string) string {
+	base := s.PortalURL()
+	if base == "" {
 		return ""
 	}
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return ""
-	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
-	}
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return ""
-	}
-	return "http://" + host + ":" + port + "/"
+	return strings.TrimRight(base, "/") + "/device/" + serial + "/"
 }
 
 func textResult(v any) (*mcp.CallToolResult, error) {

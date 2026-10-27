@@ -123,11 +123,15 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		if sess.ControlOnly() {
 			res["note"] = "control-only: no encoder allocated, no viewer URL, control tools operational"
 		} else {
-			res["url"] = url
+			if deviceURL := s.DeviceURL(rec.Serial); deviceURL != "" {
+				res["url"] = deviceURL
+			} else {
+				res["url"] = url
+			}
 			res["width"] = sess.Width()
 			res["height"] = sess.Height()
 			res["frame_rate"] = 30
-			res["note"] = "WebSocket endpoint at /ws; open the URL in a Chromium browser"
+			res["note"] = "open this URL in a Chromium browser"
 			if portal := s.PortalURL(); portal != "" {
 				res["portal_url"] = portal
 			}

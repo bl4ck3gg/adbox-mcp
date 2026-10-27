@@ -28,6 +28,7 @@ func main() {
 	debug := flag.Bool("debug", false, "Enable debug logging to stderr")
 	screenHost := flag.String("screen-host", "127.0.0.1", "Bind address for the screen viewer (use 0.0.0.0 to watch from another machine)")
 	portalPort := flag.Int("portal-port", 0, "Fixed port for the device list portal (0 = OS picks)")
+	token := flag.String("token", "", "Shared secret for the web portal (empty = auto-generate 12-hex token)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `adbox-mcp — MCP server for Android devices over raw ADB endpoints
 
@@ -46,6 +47,9 @@ through the endpoints_add / endpoints_remove tools, so no flags are needed.
 	os.Setenv("ADBOX_SCREEN_HOST", *screenHost)
 	if *portalPort > 0 {
 		os.Setenv("ADBOX_PORTAL_PORT", fmt.Sprint(*portalPort))
+	}
+	if *token != "" {
+		os.Setenv("ADBOX_TOKEN", *token)
 	}
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{

@@ -7,41 +7,24 @@ import (
 	"testing"
 )
 
-// A portal with no sessions must still answer, and it must answer with an empty
-// list rather than an error: the page a caller bookmarks is the page that has to
-// work before any device is streaming, because that is when they open it.
+func newTestPortal(t *testing.T, token string) (*Portal, *Manager) {
+	t.Helper()
+	mgr := NewManager()
+	return NewPortal(mgr, "127.0.0.1", 0, token), mgr
+}
+
+// An empty portal must answer with an empty array rather than null or an error:
+// the page does devices.length, and a null there reads as "the portal is broken".
 func TestPortalReportsEmptyList(t *testing.T) {
-	p := NewPortal(NewManager(), "127.0.0.1", 0)
+	p, _ := newTestPortal(t, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
 	rec := httptest.NewRecorder()
-	p.handleDevices(rec, req)
+	p.route(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	var body struct {
-		Count   int          `json:"count"`
-		Devices []deviceCard `json:"devices"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v (body %q)", err, rec.Body.String())
-	}
-	if body.Count != 0 || len(body.Devices) != 0 {
-		t.Fatalf("count=%d devices=%d, want zero of each", body.Count, len(body.Devices))
-	}
-}
-
-// The list must be a JSON array even when empty, never null: a page doing
-// devices.length would throw on null, and the failure would look like "the
-// portal is broken" rather than "no devices".
-func TestPortalEmptyListIsArray(t *testing.T) {
-	p := NewPortal(NewManager(), "127.0.0.1", 0)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
-	rec := httptest.NewRecorder()
-	p.handleDevices(rec, req)
-
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -51,18 +34,17 @@ func TestPortalEmptyListIsArray(t *testing.T) {
 	}
 }
 
-// A viewer URL must be built from the host the page was reached at, not from the
-// portal's bind address: a portal bound to 0.0.0.0 is reached by the machine's
-// own name, and a card pointing at 0.0.0.0:PORT is a link nobody can click.
-func TestPortalCardURLUsesRequestHost(t *testing.T) {
-	mgr := NewManager()
-	mgr.sessions["serial-a"] = &Session{serial: "serial-a", httpPort: 41888}
+// A card links to a path on the portal, never to a port of its own: the whole
+// point of the portal is that there is one address to remember.
+func TestPortalDeviceURLIsAPath(t *testing.T) {
+	p, mgr := newTestPortal(t, "")
+	sess := &Session{serial: "serial-a"}
+	sess.running.Store(true)
+	mgr.sessions["serial-a"] = sess
 
-	p := NewPortal(mgr, "0.0.0.0", 0)
 	req := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
-	req.Host = "192.168.1.50:18080"
 	rec := httptest.NewRecorder()
-	p.handleDevices(rec, req)
+	p.route(rec, req)
 
 	var body struct {
 		Devices []deviceCard `json:"devices"`
@@ -73,33 +55,100 @@ func TestPortalCardURLUsesRequestHost(t *testing.T) {
 	if len(body.Devices) != 1 {
 		t.Fatalf("devices = %d, want 1", len(body.Devices))
 	}
-	want := "http://192.168.1.50:41888/"
-	if got := body.Devices[0].URL; got != want {
+	if got, want := body.Devices[0].URL, "/device/serial-a/"; got != want {
 		t.Fatalf("url = %q, want %q", got, want)
 	}
 }
 
-// A session that has not reached its listener yet reports port 0 and an empty
-// URL, which is how the page tells "starting" from "clickable".
-func TestPortalPendingSessionHasNoURL(t *testing.T) {
-	mgr := NewManager()
-	mgr.sessions["serial-b"] = &Session{serial: "serial-b"}
+// Every route is behind the token when one is set, including the device paths:
+// a viewer that could be reached without it would make the token decoration.
+func TestPortalRequiresToken(t *testing.T) {
+	p, mgr := newTestPortal(t, "s3cret")
+	sess := &Session{serial: "serial-a"}
+	sess.running.Store(true)
+	mgr.sessions["serial-a"] = sess
 
-	p := NewPortal(mgr, "127.0.0.1", 0)
-	req := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
+	for _, path := range []string{"/", "/api/devices", "/device/serial-a/", "/device/serial-a/ws"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		p.route(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s without token = %d, want 401", path, rec.Code)
+		}
+	}
+}
+
+// The query parameter is accepted, and a bearer header too: the first is what a
+// human pastes into a browser, the second is what a script sends.
+func TestPortalAcceptsQueryAndBearer(t *testing.T) {
+	p, _ := newTestPortal(t, "s3cret")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/devices?token=s3cret", nil)
 	rec := httptest.NewRecorder()
-	p.handleDevices(rec, req)
+	p.route(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("query token = %d, want 200", rec.Code)
+	}
 
-	var body struct {
-		Devices []deviceCard `json:"devices"`
+	req = httptest.NewRequest(http.MethodGet, "/api/devices", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec = httptest.NewRecorder()
+	p.route(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bearer = %d, want 200", rec.Code)
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+}
+
+// The first authenticated page load leaves the cookie behind, because a browser
+// cannot put a header on a WebSocket handshake and the token must not be in every
+// URL the page loads.
+func TestPortalSetsCookieOnToken(t *testing.T) {
+	p, mgr := newTestPortal(t, "s3cret")
+	sess := &Session{serial: "serial-a"}
+	sess.running.Store(true)
+	mgr.sessions["serial-a"] = sess
+
+	req := httptest.NewRequest(http.MethodGet, "/device/serial-a/?token=s3cret", nil)
+	rec := httptest.NewRecorder()
+	p.route(rec, req)
+
+	var found bool
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cookieName && c.Value == "s3cret" {
+			found = true
+		}
 	}
-	if got := body.Devices[0].URL; got != "" {
-		t.Fatalf("url = %q, want empty for a pending session", got)
+	if !found {
+		t.Fatalf("no %s cookie set; got %v", cookieName, rec.Result().Cookies())
 	}
-	if got := body.Devices[0].Port; got != 0 {
-		t.Fatalf("port = %d, want 0", got)
+}
+
+// A wrong token is refused with the same status as no token: the answer must not
+// tell a guesser that the shape of the secret was right.
+func TestPortalRejectsWrongToken(t *testing.T) {
+	p, _ := newTestPortal(t, "s3cret")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/devices?token=wrong", nil)
+	rec := httptest.NewRecorder()
+	p.route(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token = %d, want 401", rec.Code)
+	}
+}
+
+// A device that is not streaming answers with a sentence, not a bare 404: the
+// caller usually has a stale tab open and needs to know which device is missing.
+func TestPortalUnknownDeviceExplainsItself(t *testing.T) {
+	p, _ := newTestPortal(t, "")
+
+	req := httptest.NewRequest(http.MethodGet, "/device/ghost/", nil)
+	rec := httptest.NewRecorder()
+	p.route(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if body := rec.Body.String(); len(body) == 0 {
+		t.Fatal("empty body; want a sentence naming the device")
 	}
 }

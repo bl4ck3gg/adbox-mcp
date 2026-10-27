@@ -18,7 +18,7 @@ func NewManager() *Manager {
 	}
 }
 
-func (m *Manager) Start(dev *adb.Device, serial string, maxSize, bitRate, viewerPort int) (string, error) {
+func (m *Manager) Start(dev *adb.Device, serial string, opts Options) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -27,7 +27,7 @@ func (m *Manager) Start(dev *adb.Device, serial string, maxSize, bitRate, viewer
 		delete(m.sessions, serial)
 	}
 
-	s := NewSession(dev, serial, maxSize, bitRate, viewerPort)
+	s := NewSession(dev, serial, opts)
 	url, err := s.Start()
 	if err != nil {
 		return "", err

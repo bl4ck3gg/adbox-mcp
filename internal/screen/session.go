@@ -30,8 +30,9 @@ type Session struct {
 	remoteJar string
 	maxSize    int
 	bitRate    int
-	viewerPort  int
-	enableAudio bool
+	viewerPort     int
+	enableVideoSrc bool
+	enableAudioSrc bool
 	uhidOn      atomic.Bool
 	audioActive atomic.Bool
 	audioConn   atomic.Pointer[net.Conn]
@@ -39,6 +40,7 @@ type Session struct {
 	probeReply  chan net.Conn
 	frameOnce   sync.Once
 	videoOn     atomic.Bool
+	audioOn     atomic.Bool
 
 	running   atomic.Bool
 	hub       *Hub
@@ -61,26 +63,74 @@ func init() {
 	scidCounter.Store(0x12340000)
 }
 
-func NewSession(dev *adb.Device, serial string, maxSize, bitRate, viewerPort int) *Session {
+// Options are launch-time choices for the on-device server.
+//
+// These are not the same switches as SetVideoEnabled/SetAudioEnabled. Launching
+// with Video=false allocates no encoder and opens no video socket at all; a
+// stream that was never started cannot be turned on later. The runtime messages
+// stop and resume an encoder that already exists. Both layers are useful: the
+// first saves the expensive resource outright, the second toggles without a
+// reconnect.
+type Options struct {
+	MaxSize    int
+	BitRate    int
+	ViewerPort int
+	// Video and Audio are pointers so "not specified" stays distinguishable from
+	// "explicitly false", which is what the MCP layer needs.
+	Video *bool
+	Audio *bool
+}
+
+func (o Options) videoEnabled() bool { return o.Video == nil || *o.Video }
+func (o Options) audioEnabled() bool { return o.Audio == nil || *o.Audio }
+
+func NewSession(dev *adb.Device, serial string, opts Options) *Session {
+	maxSize := opts.MaxSize
 	if maxSize <= 0 {
 		maxSize = 1080
 	}
+	bitRate := opts.BitRate
 	if bitRate <= 0 {
 		bitRate = 4000000
 	}
 	scid := scidCounter.Add(1) & 0x7fffffff
 	se := &Session{
-		dev:       dev,
-		serial:    serial,
-		scid:      scid,
-		remoteJar: embedded.ScrcpyRemotePath,
+		dev:        dev,
+		serial:     serial,
+		scid:       scid,
+		remoteJar:  embedded.ScrcpyRemotePath,
 		maxSize:    maxSize,
 		bitRate:    bitRate,
-		viewerPort: viewerPort,
+		viewerPort: opts.ViewerPort,
+		enableVideoSrc: opts.videoEnabled(),
+		enableAudioSrc: opts.audioEnabled(),
 		hub:        newHub(),
 	}
-	se.videoOn.Store(true)
+	se.videoOn.Store(opts.videoEnabled())
+	se.audioOn.Store(opts.audioEnabled())
 	se.firstFrame = make(chan struct{})
+
+	// The encoder is the expensive part of a mirror. When the last viewer goes
+	// away there is nobody to send frames to, so stop encoding; resume when
+	// somebody attaches. This is the reference implementation's resident
+	// keep-alive, expressed as viewer count instead of a consumer counter.
+	//
+	// Only meaningful when video was enabled at launch: a session started with
+	// video=false has no encoder to stop or start.
+	if opts.videoEnabled() {
+		se.hub.onFirstViewer = func() {
+			if !se.videoOn.Load() {
+				slog.Info("screen: viewer attached, resuming encoder", "device", se.serial)
+				se.SetVideoEnabled(true)
+			}
+		}
+		se.hub.onLastViewer = func() {
+			if se.videoOn.Load() {
+				slog.Info("screen: last viewer left, pausing encoder", "device", se.serial)
+				se.SetVideoEnabled(false)
+			}
+		}
+	}
 	return se
 }
 
@@ -125,8 +175,21 @@ func (s *Session) Start() (webUrl string, err error) {
 	// then probe which layout actually happened and adapt.
 	socketName := fmt.Sprintf("scrcpy_%08x", s.scid)
 	maxLong := s.maxSize &^ 7
-	launchCmd := fmt.Sprintf("/system/bin/nohup env CLASSPATH=%s app_process / %s %s scid=%08x log_level=debug tunnel_forward=true audio=true audio_codec=opus audio_source=output max_size=%d video_bit_rate=%d max_fps=30 video_codec_options=i-frame-interval=1 >/dev/null 2>&1 </dev/null &",
-		s.remoteJar, embedded.ScrcpyMainClass, embedded.ScrcpyVersion, s.scid, maxLong, s.bitRate)
+
+	// Assemble launch flags according to the requested streams.
+	var args []string
+	if !s.enableVideoSrc {
+		args = append(args, "video=false")
+	} else {
+		args = append(args, fmt.Sprintf("max_size=%d", maxLong), fmt.Sprintf("video_bit_rate=%d", s.bitRate), "max_fps=30", "video_codec_options=i-frame-interval=1")
+	}
+	if !s.enableAudioSrc {
+		args = append(args, "audio=false")
+	} else {
+		args = append(args, "audio=true", "audio_codec=opus", "audio_source=output")
+	}
+	launchCmd := fmt.Sprintf("/system/bin/nohup env CLASSPATH=%s app_process / %s %s scid=%08x log_level=debug tunnel_forward=true %s >/dev/null 2>&1 </dev/null &",
+		s.remoteJar, embedded.ScrcpyMainClass, embedded.ScrcpyVersion, s.scid, strings.Join(args, " "))
 
 	if err := s.dev.RunInteractiveShellLinesFireAndClose([]string{launchCmd, "sleep 1"}); err != nil {
 		return "", fmt.Errorf("spawn scrcpy: %w", err)
@@ -141,25 +204,44 @@ func (s *Session) Start() (webUrl string, err error) {
 		return "", fmt.Errorf("forward scrcpy socket: %w", err)
 	}
 
-	// 5. Video socket. Always first, and it is the only one that gets a dummy
-	//    byte, so receiving it proves the server is up and the order is right.
-	videoConn, err := s.dev.DialRemote("127.0.0.1", fwdPort)
-	if err != nil {
-		return "", fmt.Errorf("dial video socket: %w", err)
-	}
-	dummy := make([]byte, 1)
-	if _, err := io.ReadFull(videoConn, dummy); err != nil {
-		_ = videoConn.Close()
-		return "", fmt.Errorf("read video dummy: %w", err)
-	}
-
-	// 6. Start the demuxer before probing, so "did a frame arrive" is an
-	//    observable signal rather than a guess.
 	s.running.Store(true)
 	go s.hub.Run()
-	go s.readVideoLoop(videoConn)
 
-	// 7. Discover which connection is the control socket.
+	var videoConn net.Conn
+	if s.enableVideoSrc {
+		// Video socket. Always first when video is enabled, and the only one that
+		// receives the dummy byte.
+		videoConn, err = s.dev.DialRemote("127.0.0.1", fwdPort)
+		if err != nil {
+			return "", fmt.Errorf("dial video socket: %w", err)
+		}
+		dummy := make([]byte, 1)
+		if _, err := io.ReadFull(videoConn, dummy); err != nil {
+			_ = videoConn.Close()
+			return "", fmt.Errorf("read video dummy: %w", err)
+		}
+		go s.readVideoLoop(videoConn)
+	}
+
+	// 7. Discover the control socket.
+	//
+	// In control-only mode (video=false, audio=false) there is exactly ONE socket
+	// and it gets the dummy byte because sendDummyByte is once per server run.
+	if !s.enableVideoSrc && !s.enableAudioSrc {
+		control, err := s.dev.DialRemote("127.0.0.1", fwdPort)
+		if err != nil {
+			return "", fmt.Errorf("dial control-only socket: %w", err)
+		}
+		dummy := make([]byte, 1)
+		if _, err := io.ReadFull(control, dummy); err != nil {
+			_ = control.Close()
+			return "", fmt.Errorf("read control-only dummy: %w", err)
+		}
+		s.controlConn.Store(&control)
+		go s.readControlLoop(control)
+		slog.Info("screen: control-only session started", "device", s.serial)
+		return "", nil // no web viewer URL; caller gets pure control
+	}
 	//
 	// The server accepts video, then optionally audio, then control, so after the
 	// video socket the next connections are (audio?, control). Whether audio
@@ -303,7 +385,10 @@ func (s *Session) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.InjectRawControl(msg)
 	}
 
-	s.hub.unregister <- c
+	select {
+	case s.hub.unregister <- c:
+	case <-s.hub.stop:
+	}
 	_ = conn.Close()
 	<-done
 }
@@ -391,7 +476,7 @@ func (s *Session) readVideoLoop(conn net.Conn) {
 
 		// Non-blocking fanout to all active browser channels
 		s.markFirstFrame()
-		s.hub.Broadcast(TagVideo(out))
+		s.hub.Broadcast(TagVideo(out), isKey || hasConfig)
 	}
 }
 
@@ -451,7 +536,7 @@ func (s *Session) readControlLoop(conn net.Conn) {
 					"type": "clipboard",
 					"text": ev.Text,
 				}); err == nil {
-					s.hub.Broadcast(TagInfo(info))
+					s.hub.Broadcast(TagInfo(info), true)
 				}
 			case devDisplayGeometry:
 				s.hub.rotation.Store(int32(ev.Rotation))
@@ -467,7 +552,7 @@ func (s *Session) readControlLoop(conn net.Conn) {
 					"width":    ev.Width,
 					"height":   ev.Height,
 				}); err == nil {
-					s.hub.Broadcast(TagInfo(info))
+					s.hub.Broadcast(TagInfo(info), true)
 				}
 			}
 		}
@@ -582,7 +667,7 @@ func (s *Session) readAudioLoop(conn net.Conn) {
 		"type":  "audio-codec",
 		"codec": codec.String(),
 	}); err == nil {
-		s.hub.Broadcast(TagInfo(info))
+		s.hub.Broadcast(TagInfo(info), true)
 	}
 
 	header := make([]byte, 12)
@@ -598,7 +683,7 @@ func (s *Session) readAudioLoop(conn net.Conn) {
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return
 		}
-		s.hub.Broadcast(TagAudio(payload))
+		s.hub.Broadcast(TagAudio(payload), true)
 	}
 }
 
@@ -824,3 +909,21 @@ func mustDial(dev *adb.Device, port int) net.Conn {
 	}
 	return c
 }
+
+// SetAudioEnabled dynamically toggles audio encoding via control message 19.
+func (s *Session) SetAudioEnabled(on bool) {
+	s.InjectRawControl(SetAudioEnabled(on))
+	s.audioOn.Store(on)
+}
+
+// AudioEnabled reports the last runtime audio state requested.
+func (s *Session) AudioEnabled() bool { return s.audioOn.Load() }
+
+// ControlOnly reports whether this session was launched without video/audio.
+func (s *Session) ControlOnly() bool { return !s.enableVideoSrc && !s.enableAudioSrc }
+
+// Width reports the decoded video width in pixels, or 0 if unknown yet.
+func (s *Session) Width() int { return int(s.hub.width.Load()) }
+
+// Height reports the decoded video height in pixels, or 0 if unknown yet.
+func (s *Session) Height() int { return int(s.hub.height.Load()) }

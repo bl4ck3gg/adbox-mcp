@@ -6,42 +6,55 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// client is one attached browser. It owns a bounded channel so a slow or
-// backgrounded tab drops frames rather than blocking the demux loop.
+// Backlog thresholds for the per-viewer drop policy, copied from mr-robot's
+// stream_supervisor.go. A viewer that falls behind skips P-frames until an IDR
+// arrives and the queue has drained below the exit threshold.
+const (
+	backlogEnterGE      = 10 // queued >= this -> start dropping P
+	backlogExitRemainLT = 3  // queued < this on a keyframe -> stop dropping
+)
+
 type client struct {
 	conn   *websocket.Conn
 	frames chan []byte
+	dropP  atomic.Bool
 }
 
 func newClient(conn *websocket.Conn) *client {
 	return &client{
 		conn:   conn,
-		frames: make(chan []byte, 30), // ~1 second of video at 30 fps
+		frames: make(chan []byte, 30),
 	}
 }
 
-// Hub manages active viewers using channels and atomics, with no mutex in the
-// frame delivery path.
+type outFrame struct {
+	data  []byte
+	isKey bool
+}
+
 type Hub struct {
 	register   chan *client
 	unregister chan *client
-	broadcast  chan []byte
+	broadcast  chan outFrame
 	stop       chan struct{}
 
-	// Video parameters are read concurrently by handlers, updated atomically
-	spsPps  atomic.Pointer[[]byte]
-	lastKey atomic.Pointer[[]byte]
-	width    atomic.Int32
-	height   atomic.Int32
+	spsPps     atomic.Pointer[[]byte]
+	lastKey    atomic.Pointer[[]byte]
+	width      atomic.Int32
+	height     atomic.Int32
 	rotation   atomic.Int32
 	audioCodec atomic.Int32
+	viewers    atomic.Int32
+
+	onFirstViewer func()
+	onLastViewer  func()
 }
 
 func newHub() *Hub {
 	return &Hub{
 		register:   make(chan *client),
 		unregister: make(chan *client),
-		broadcast:  make(chan []byte, 60),
+		broadcast:  make(chan outFrame, 60),
 		stop:       make(chan struct{}),
 	}
 }
@@ -55,12 +68,11 @@ func (h *Hub) Run() {
 				close(c.frames)
 				_ = c.conn.Close()
 			}
+			h.viewers.Store(0)
 			return
 
 		case c := <-h.register:
 			clients[c] = true
-			// Replay cached configuration and latest keyframe to the new viewer
-			// so its decoder starts immediately without waiting for a GOP cycle.
 			if p := h.spsPps.Load(); p != nil && len(*p) > 0 {
 				select {
 				case c.frames <- *p:
@@ -73,34 +85,53 @@ func (h *Hub) Run() {
 				default:
 				}
 			}
+			if n := h.viewers.Add(1); n == 1 && h.onFirstViewer != nil {
+				go h.onFirstViewer()
+			}
 
 		case c := <-h.unregister:
 			if _, ok := clients[c]; ok {
 				delete(clients, c)
 				close(c.frames)
+				if n := h.viewers.Add(-1); n == 0 && h.onLastViewer != nil {
+					go h.onLastViewer()
+				}
 			}
 
-		case frame := <-h.broadcast:
-			// Non-blocking fanout: if a viewer's buffer is full, drop the frame
-			// for THAT viewer only. Other viewers and the source stream stay smooth.
+		case f := <-h.broadcast:
 			for c := range clients {
-				select {
-				case c.frames <- frame:
-				default:
-					// Dropped for this slow client; backpressure isolated
-				}
+				h.deliver(c, f)
 			}
 		}
 	}
 }
 
-func (h *Hub) Broadcast(frame []byte) {
+func (h *Hub) deliver(c *client, f outFrame) {
+	drop := c.dropP.Load()
+	if drop && !f.isKey {
+		return
+	}
 	select {
-	case h.broadcast <- frame:
+	case c.frames <- f.data:
+		depth := len(c.frames)
+		if depth >= backlogEnterGE {
+			c.dropP.Store(true)
+		} else if f.isKey && depth < backlogExitRemainLT {
+			c.dropP.Store(false)
+		}
 	default:
-		// Hub itself is saturated; drop to avoid blocking the hardware decoder
+		c.dropP.Store(true)
 	}
 }
+
+func (h *Hub) Broadcast(data []byte, isKey bool) {
+	select {
+	case h.broadcast <- outFrame{data: data, isKey: isKey}:
+	default:
+	}
+}
+
+func (h *Hub) Viewers() int { return int(h.viewers.Load()) }
 
 func (h *Hub) Stop() {
 	select {

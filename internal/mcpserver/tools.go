@@ -77,27 +77,59 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		MaxSize      int    `json:"max_size,omitempty" jsonschema:"Longest screen side in pixels (default 1080)"`
 		VideoBitRate int    `json:"video_bit_rate,omitempty" jsonschema:"Encoder bitrate in bps (default 4000000)"`
 		ViewerPort   int    `json:"viewer_port,omitempty" jsonschema:"Fixed port for the web viewer. Omit for an OS-assigned port, which changes every restart."`
+		Video        *bool  `json:"video,omitempty" jsonschema:"Launch with video encoding (default true). false allocates no encoder at all."`
+		Audio        *bool  `json:"audio,omitempty" jsonschema:"Launch with audio capture (default true, auto-detected). false opens no audio socket."`
+		ControlOnly  bool   `json:"control_only,omitempty" jsonschema:"Shorthand for video=false audio=false: zero encoders, zero sockets beyond control."`
 	}
 	handle(srv, &mcp.Tool{
 		Name: "device_screen_start",
-		Description: "Start live screen streaming. Returns a web URL that renders the device screen " +
-			"in any Chromium browser via WebCodecs, with mouse/touch control. " +
-			"Scrcpy server is pushed on demand; port is chosen by the OS.",
+		Description: "Start a scrcpy session. With video (the default) it returns a web URL that renders " +
+			"the screen in any Chromium browser via WebCodecs, with mouse and touch control. With " +
+			"video=false audio=false it returns no URL and allocates no encoder: pure control, which " +
+			"is the cheap way to inject input on a device that is not being watched.",
 	}, func(ctx context.Context, args screenStartArgs) (*mcp.CallToolResult, error) {
 		dev, rec, err := s.mgr.ResolveDevice(args.Device)
 		if err != nil {
 			return errResult("resolve device: %v", err)
 		}
-		url, err := s.screen.Start(dev, rec.Serial, args.MaxSize, args.VideoBitRate, args.ViewerPort)
+		opts := screen.Options{
+			MaxSize:    args.MaxSize,
+			BitRate:    args.VideoBitRate,
+			ViewerPort: args.ViewerPort,
+			Video:      args.Video,
+			Audio:      args.Audio,
+		}
+		if args.ControlOnly {
+			off := false
+			opts.Video = &off
+			opts.Audio = &off
+		}
+		url, err := s.screen.Start(dev, rec.Serial, opts)
 		if err != nil {
 			return errResult("start screen: %v", err)
 		}
-		return textResult(map[string]any{
-			"device":   rec.Serial,
-			"endpoint": rec.Endpoint,
-			"url":      url,
-			"alive":    true,
-		})
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("session vanished after start")
+		}
+
+		res := map[string]any{
+			"device":       rec.Serial,
+			"endpoint":     rec.Endpoint,
+			"alive":        true,
+			"control_only": sess.ControlOnly(),
+			"audio_active": sess.AudioActive(),
+		}
+		if sess.ControlOnly() {
+			res["note"] = "control-only: no encoder allocated, no viewer URL, control tools operational"
+		} else {
+			res["url"] = url
+			res["width"] = sess.Width()
+			res["height"] = sess.Height()
+			res["frame_rate"] = 30
+			res["note"] = "WebSocket endpoint at /ws; open the URL in a Chromium browser"
+		}
+		return textResult(res)
 	})
 
 	type screenStopArgs struct {
@@ -323,9 +355,10 @@ func (s *Server) registerTools(srv *mcp.Server) {
 	})
 
 	type screenVideoArgs struct {
-		Device  string `json:"device" jsonschema:"Device serial"`
-		Enabled *bool  `json:"enabled,omitempty" jsonschema:"true resumes encoding, false stops it. Omit to query."`
-		Keyframe bool  `json:"keyframe,omitempty" jsonschema:"Ask the encoder for an immediate IDR frame"`
+		Device   string `json:"device" jsonschema:"Device serial"`
+		Enabled  *bool  `json:"enabled,omitempty" jsonschema:"Video: true resumes encoding, false stops it. Omit to query."`
+		Audio    *bool  `json:"audio,omitempty" jsonschema:"Audio: true resumes capture, false stops it. Omit to query."`
+		Keyframe bool   `json:"keyframe,omitempty" jsonschema:"Ask the encoder for an immediate IDR frame"`
 	}
 	handle(srv, &mcp.Tool{
 		Name: "device_screen_video",
@@ -343,10 +376,19 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		if args.Enabled != nil {
 			sess.SetVideoEnabled(*args.Enabled)
 		}
+		if args.Audio != nil {
+			sess.SetAudioEnabled(*args.Audio)
+		}
 		if args.Keyframe {
 			sess.RequestKeyFrame()
 		}
-		return textResult(map[string]any{"device": rec.Serial, "video_enabled": sess.VideoEnabled(), "keyframe_requested": args.Keyframe})
+		return textResult(map[string]any{
+			"device":             rec.Serial,
+			"video_enabled":      sess.VideoEnabled(),
+			"audio_enabled":      sess.AudioEnabled(),
+			"keyframe_requested": args.Keyframe,
+			"control_only":       sess.ControlOnly(),
+		})
 	})
 
 	// ── device_reboot ────────────────────────────────────────────────────

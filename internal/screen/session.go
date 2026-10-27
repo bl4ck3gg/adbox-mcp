@@ -7,9 +7,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -19,29 +20,19 @@ import (
 )
 
 // Session manages one live scrcpy streaming instance for a device.
-// It owns the device-side app_process, the video socket reader, the control
-// socket writer, and a fanout broadcaster serving any number of WebSocket viewers.
+// Frame fanout and state use channels and atomics: no mutex touches the delivery path.
 type Session struct {
-	dev         *adb.Device
-	serial      string
-	scid        uint32
-	remoteJar   string
-	maxSize     int
-	bitRate     int
+	dev       *adb.Device
+	serial    string
+	scid      uint32
+	remoteJar string
+	maxSize   int
+	bitRate   int
 
-	mu          sync.Mutex
-	running     bool
-	videoWidth  int
-	videoHeight int
-	spsPps      []byte // Cached configuration frame (SPS+PPS) for new viewers
+	running   atomic.Bool
+	hub       *Hub
 
-	controlConn net.Conn
-	frameCount  uint64
-	controlMu   sync.Mutex
-
-	clientsMu   sync.RWMutex
-	clients     map[*websocket.Conn]bool
-
+	controlConn atomic.Pointer[net.Conn]
 	httpListener net.Listener
 	httpPort     int
 }
@@ -50,30 +41,32 @@ var (
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
-	scidCounter uint32 = 0x12340000
+	scidCounter atomic.Uint32
 )
+
+func init() {
+	scidCounter.Store(0x12340000)
+}
 
 func NewSession(dev *adb.Device, serial string, maxSize, bitRate int) *Session {
 	if maxSize <= 0 {
 		maxSize = 1080
 	}
 	if bitRate <= 0 {
-		bitRate = 4000000 // 4 Mbps default
+		bitRate = 4000000
 	}
-	scidCounter++
+	scid := scidCounter.Add(1) & 0x7fffffff
 	return &Session{
 		dev:       dev,
 		serial:    serial,
-		scid:      scidCounter & 0x7fffffff,
+		scid:      scid,
 		remoteJar: embedded.ScrcpyRemotePath,
 		maxSize:   maxSize,
 		bitRate:   bitRate,
-		clients:   make(map[*websocket.Conn]bool),
+		hub:       newHub(),
 	}
 }
 
-// Start pushes the jar if needed, launches scrcpy-server, connects the
-// video and control sockets, and starts the HTTP+WebSocket viewer server.
 func (s *Session) Start() (webUrl string, err error) {
 	// 1. Push scrcpy-server.jar if size differs
 	needPush := true
@@ -87,119 +80,105 @@ func (s *Session) Start() (webUrl string, err error) {
 			return "", fmt.Errorf("open jar writer: %w", err)
 		}
 		if _, err = w.Write(embedded.ScrcpyServer); err != nil {
-			w.Close()
+			_ = w.Close()
 			return "", fmt.Errorf("write jar: %w", err)
 		}
 		_ = w.Close()
 	}
 
-	// 2. Kill any stale scrcpy session on this device
+	// 2. Kill stale instances
 	_, _ = s.dev.RunCommand("pkill -f " + embedded.ScrcpyMainClass)
 	time.Sleep(200 * time.Millisecond)
 
 	// 3. Launch scrcpy-server via app_process
 	socketName := fmt.Sprintf("scrcpy_%08x", s.scid)
 	maxLong := s.maxSize &^ 7
-	launchCmd := fmt.Sprintf("/system/bin/nohup env CLASSPATH=%s app_process / %s %s scid=%08x log_level=debug tunnel_forward=true audio=false max_size=%d video_bit_rate=%d >/dev/null 2>&1 </dev/null &",
+	launchCmd := fmt.Sprintf("/system/bin/nohup env CLASSPATH=%s app_process / %s %s scid=%08x log_level=debug tunnel_forward=true audio=false max_size=%d video_bit_rate=%d max_fps=30 video_codec_options=i-frame-interval=1 >/dev/null 2>&1 </dev/null &",
 		s.remoteJar, embedded.ScrcpyMainClass, embedded.ScrcpyVersion, s.scid, maxLong, s.bitRate)
 
 	if err := s.dev.RunInteractiveShellLinesFireAndClose([]string{launchCmd, "sleep 1"}); err != nil {
 		return "", fmt.Errorf("spawn scrcpy: %w", err)
 	}
 
-	// Wait for the localabstract socket to be listening
 	time.Sleep(300 * time.Millisecond)
 
-	// 4. Forward the abstract socket to a free host port
+	// 4. Forward abstract socket to a free host port
 	remSpec := adb.ForwardSpec{Protocol: adb.FProtocolAbstract, PortOrName: socketName}
 	fwdPort, err := s.dev.ForwardToFreePort(remSpec)
 	if err != nil {
 		return "", fmt.Errorf("forward scrcpy socket: %w", err)
 	}
 
-	// 5. Connect Video Socket (first connection)
+	// 5. Connect Video Socket
 	videoConn, err := s.dev.DialRemote("127.0.0.1", fwdPort)
 	if err != nil {
 		return "", fmt.Errorf("dial video socket: %w", err)
 	}
 
-	// Read dummy byte (0x00)
+	// Dummy byte on first socket
 	dummy := make([]byte, 1)
 	if _, err := io.ReadFull(videoConn, dummy); err != nil {
-		videoConn.Close()
+		_ = videoConn.Close()
 		return "", fmt.Errorf("read video dummy: %w", err)
 	}
 
-	// 6. Connect Control Socket (second connection)
+	// 6. Connect Control Socket
 	controlConn, err := s.dev.DialRemote("127.0.0.1", fwdPort)
 	if err != nil {
-		videoConn.Close()
+		_ = videoConn.Close()
 		return "", fmt.Errorf("dial control socket: %w", err)
 	}
-	// scrcpy writes the dummy byte only on the FIRST accepted socket (video);
-	// after that sendDummyByte is false, so the control socket gets nothing.
-	// Reading here would block forever, so the control channel is used as-is.
-	s.controlConn = controlConn
-	slog.Debug("screen: control socket connected")
+	s.controlConn.Store(&controlConn)
 
-	// Video encoding starts DISABLED in this build of the server (a local
-	// extension: TYPE_SET_VIDEO_ENABLED=18 / TYPE_SET_AUDIO_ENABLED=19 are not
-	// upstream scrcpy). The encoder thread waits on that flag before it writes
-	// the 12-byte video header, so without this two-byte message the stream
-	// never begins and the video socket stays silent forever -- which looks
-	// exactly like a broken tunnel.
+	// Enable video encoding (scrcpy extension requirement)
 	if _, err := controlConn.Write([]byte{18, 1}); err != nil {
-		videoConn.Close()
-		controlConn.Close()
-		return "", fmt.Errorf("enable video stream: %w", err)
+		_ = videoConn.Close()
+		_ = controlConn.Close()
+		return "", fmt.Errorf("enable video: %w", err)
 	}
-	slog.Debug("screen: sent enable-video")
 
-	// 7. Start local HTTP / WebSocket fanout server
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// 7. Start fanout hub loop (pure channel-based)
+	go s.hub.Run()
+
+	// 8. Start HTTP viewer server
+	bindHost := os.Getenv("ADBOX_SCREEN_HOST")
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(bindHost, "0"))
 	if err != nil {
-		videoConn.Close()
-		controlConn.Close()
-		return "", fmt.Errorf("listen http: %w", err)
+		_ = videoConn.Close()
+		_ = controlConn.Close()
+		s.hub.Stop()
+		return "", fmt.Errorf("listen viewer: %w", err)
 	}
 	s.httpListener = ln
 	s.httpPort = ln.Addr().(*net.TCPAddr).Port
-	s.running = true
+	s.running.Store(true)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/ws", s.handleWS)
 	go http.Serve(ln, mux)
 
-	// 8. Start video demuxer & broadcaster loop
+	// 9. Start video demuxer loop
 	go s.readVideoLoop(videoConn)
 
-	webUrl = fmt.Sprintf("http://127.0.0.1:%d/", s.httpPort)
+	webUrl = fmt.Sprintf("http://%s:%d/", bindHost, s.httpPort)
 	slog.Info("screen session started", "device", s.serial, "web", webUrl, "fwd", fwdPort)
 	return webUrl, nil
 }
 
 func (s *Session) Close() {
-	s.mu.Lock()
-	s.running = false
+	s.running.Store(false)
+	s.hub.Stop()
+
 	if s.httpListener != nil {
 		_ = s.httpListener.Close()
 	}
-	s.mu.Unlock()
-
-	s.controlMu.Lock()
-	if s.controlConn != nil {
-		_ = s.controlConn.Close()
+	if c := s.controlConn.Load(); c != nil {
+		_ = (*c).Close()
 	}
-	s.controlMu.Unlock()
-
-	s.clientsMu.Lock()
-	for c := range s.clients {
-		_ = c.Close()
-	}
-	s.clients = make(map[*websocket.Conn]bool)
-	s.clientsMu.Unlock()
-
 	_, _ = s.dev.RunCommand("pkill -f " + embedded.ScrcpyMainClass)
 }
 
@@ -209,85 +188,62 @@ func (s *Session) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.clientsMu.Lock()
-	s.clients[conn] = true
-	// If we already have the SPS/PPS config frame, send it immediately to this new viewer
-	// so their WebCodecs decoder initializes without waiting for the next keyframe.
-	s.mu.Lock()
-	if len(s.spsPps) > 0 {
-		_ = conn.WriteMessage(websocket.BinaryMessage, s.spsPps)
-	}
-	s.mu.Unlock()
-	s.clientsMu.Unlock()
+	c := newClient(conn)
+	s.hub.register <- c
 
-	defer func() {
-		s.clientsMu.Lock()
-		delete(s.clients, conn)
-		s.clientsMu.Unlock()
-		conn.Close()
+	// Dedicated per-client writer: pulls frames from bounded channel
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for frame := range c.frames {
+			if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+				return
+			}
+		}
 	}()
 
-	// Read control messages from browser and inject to scrcpy
+	// Reader: pipes browser touch/key packets to control socket
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
-		// Protocol: binary control packet forwarded directly to control socket
 		s.InjectRawControl(msg)
 	}
-}
 
-func (s *Session) broadcast(data []byte) {
-	s.clientsMu.RLock()
-	defer s.clientsMu.RUnlock()
-	for client := range s.clients {
-		_ = client.WriteMessage(websocket.BinaryMessage, data)
-	}
+	s.hub.unregister <- c
+	_ = conn.Close()
+	<-done
 }
 
 func (s *Session) readVideoLoop(conn net.Conn) {
 	defer conn.Close()
-	slog.Debug("screen: video loop started")
 
-	// 1. Consume 64-byte device name header (or directly codec header)
+	// 1. Consume device name (64B) or direct 12B codec header
 	first4 := make([]byte, 4)
-	if n, err := io.ReadFull(conn, first4); err != nil {
-		slog.Debug("screen: header read failed", "n", n, "err", err)
+	if _, err := io.ReadFull(conn, first4); err != nil {
 		return
 	}
-	slog.Debug("screen: first4", "hex", fmt.Sprintf("%x", first4), "ascii", string(first4))
 	codecID := binary.BigEndian.Uint32(first4)
-	if codecID != 0x68323634 { // not "h264" directly -> deviceMeta 64 bytes
+	if codecID != 0x68323634 {
 		remain := make([]byte, 60)
-		if n, e := io.ReadFull(conn, remain); e != nil {
-			slog.Debug("screen: devicemeta read failed", "n", n, "err", e)
-			return
-		}
-		slog.Debug("screen: device meta consumed")
-		// Read actual 12-byte video header
+		_, _ = io.ReadFull(conn, remain)
 		vhdr := make([]byte, 12)
-		if n, err := io.ReadFull(conn, vhdr); err != nil {
-			slog.Debug("screen: vhdr read failed", "n", n, "err", err)
+		if _, err := io.ReadFull(conn, vhdr); err != nil {
 			return
 		}
-		slog.Debug("screen: vhdr", "codec", string(vhdr[0:4]), "w", binary.BigEndian.Uint32(vhdr[4:8]), "h", binary.BigEndian.Uint32(vhdr[8:12]))
-		s.mu.Lock()
-		s.videoWidth = int(binary.BigEndian.Uint32(vhdr[4:8]))
-		s.videoHeight = int(binary.BigEndian.Uint32(vhdr[8:12]))
-		s.mu.Unlock()
+		s.hub.width.Store(int32(binary.BigEndian.Uint32(vhdr[4:8])))
+		s.hub.height.Store(int32(binary.BigEndian.Uint32(vhdr[8:12])))
 	} else {
 		rest8 := make([]byte, 8)
 		_, _ = io.ReadFull(conn, rest8)
-		s.mu.Lock()
-		s.videoWidth = int(binary.BigEndian.Uint32(rest8[0:4]))
-		s.videoHeight = int(binary.BigEndian.Uint32(rest8[4:8]))
-		s.mu.Unlock()
+		s.hub.width.Store(int32(binary.BigEndian.Uint32(rest8[0:4])))
+		s.hub.height.Store(int32(binary.BigEndian.Uint32(rest8[4:8])))
 	}
 
-	headerBuf := make([]byte, 12) // 8 bytes PTS/flags + 4 bytes size
+	headerBuf := make([]byte, 12)
 
-	for s.running {
+	for s.running.Load() {
 		if _, err := io.ReadFull(conn, headerBuf); err != nil {
 			break
 		}
@@ -299,78 +255,81 @@ func (s *Session) readVideoLoop(conn net.Conn) {
 
 		frame := make([]byte, frameLen)
 		if _, err := io.ReadFull(conn, frame); err != nil {
-			slog.Debug("screen: read frame failed", "err", err)
 			break
 		}
-		if s.frameCount == 0 {
-			slog.Debug("screen: first frame", "len", frameLen, "config", (ptsValue&(1<<63)) != 0)
-		}
-		s.frameCount++
 
 		isConfig := (ptsValue & (1 << 63)) != 0
-		if isConfig {
-			s.mu.Lock()
-			s.spsPps = frame
-			s.mu.Unlock()
+		isKey := (ptsValue & (1 << 62)) != 0
+
+		// Identify NAL unit type directly
+		hasConfig := isConfig
+		for i := 0; i+4 < len(frame); i++ {
+			if frame[i] == 0 && frame[i+1] == 0 && (frame[i+2] == 1 || (frame[i+2] == 0 && frame[i+3] == 1)) {
+				offset := i + 3
+				if frame[i+2] == 0 {
+					offset = i + 4
+				}
+				nalType := frame[offset] & 0x1f
+				if nalType == 7 || nalType == 8 {
+					hasConfig = true
+				}
+				if nalType == 5 {
+					isKey = true
+				}
+			}
 		}
 
-		// Broadcast to all active browsers
-		s.broadcast(frame)
+		if hasConfig {
+			cp := append([]byte(nil), frame...)
+			s.hub.spsPps.Store(&cp)
+		}
+
+		out := frame
+		if isKey {
+			// Prepend SPS/PPS to every IDR keyframe so new viewers can start instantly
+			if p := s.hub.spsPps.Load(); p != nil && len(*p) > 0 {
+				combined := make([]byte, 0, len(*p)+len(frame))
+				combined = append(combined, *p...)
+				combined = append(combined, frame...)
+				out = combined
+			}
+			cpKey := append([]byte(nil), out...)
+			s.hub.lastKey.Store(&cpKey)
+		}
+
+		// Non-blocking fanout to all active browser channels
+		s.hub.Broadcast(out)
 	}
 }
 
-// InjectRawControl sends a raw scrcpy binary control packet.
 func (s *Session) InjectRawControl(data []byte) {
-	s.controlMu.Lock()
-	defer s.controlMu.Unlock()
-	if s.controlConn != nil && len(data) > 0 {
-		_, _ = s.controlConn.Write(data)
+	if c := s.controlConn.Load(); c != nil && len(data) > 0 {
+		_, _ = (*c).Write(data)
 	}
 }
 
-// InjectTouch injects a touch event using scrcpy binary protocol.
-// action: 0=DOWN, 1=UP, 2=MOVE
 func (s *Session) InjectTouch(action int, x, y int) {
-	s.mu.Lock()
-	w, h := s.videoWidth, s.videoHeight
-	s.mu.Unlock()
+	w := int(s.hub.width.Load())
+	h := int(s.hub.height.Load())
 	if w <= 0 { w = 1080 }
 	if h <= 0 { h = 2220 }
 
-	// Format:
-	// type: 1B (0x02 = TYPE_INJECT_TOUCH_EVENT)
-	// action: 1B
-	// pointerId: 8B
-	// x: 4B
-	// y: 4B
-	// screenWidth: 2B
-	// screenHeight: 2B
-	// pressure: 2B (0xFFFF = 1.0f)
-	// actionButton: 4B
-	// buttons: 4B
 	buf := make([]byte, 32)
 	buf[0] = 2 // TYPE_INJECT_TOUCH_EVENT
 	buf[1] = byte(action)
-	binary.BigEndian.PutUint64(buf[2:10], 0) // pointerId = 0
+	binary.BigEndian.PutUint64(buf[2:10], 0)
 	binary.BigEndian.PutUint32(buf[10:14], uint32(x))
 	binary.BigEndian.PutUint32(buf[14:18], uint32(y))
 	binary.BigEndian.PutUint16(buf[18:20], uint16(w))
 	binary.BigEndian.PutUint16(buf[20:22], uint16(h))
-	binary.BigEndian.PutUint16(buf[22:24], 0xffff) // pressure = 1.0
-	binary.BigEndian.PutUint32(buf[24:28], 1)      // primary button
-	binary.BigEndian.PutUint32(buf[28:32], 1)      // buttons
+	binary.BigEndian.PutUint16(buf[22:24], 0xffff)
+	binary.BigEndian.PutUint32(buf[24:28], 1)
+	binary.BigEndian.PutUint32(buf[28:32], 1)
 
 	s.InjectRawControl(buf)
 }
 
-// InjectKeycode sends an Android key event.
-// action: 0=DOWN, 1=UP
 func (s *Session) InjectKeycode(action, keycode int) {
-	// type: 1B (0x00 = TYPE_INJECT_KEYCODE)
-	// action: 1B
-	// keycode: 4B
-	// repeat: 4B
-	// metaState: 4B
 	buf := make([]byte, 14)
 	buf[0] = 0 // TYPE_INJECT_KEYCODE
 	buf[1] = byte(action)

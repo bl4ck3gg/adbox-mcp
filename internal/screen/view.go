@@ -101,19 +101,33 @@ ws.onmessage = (e) => {
     }
   }
 
-  if (isConfig || decoder.state === 'unconfigured') {
-    decoder.configure({
-      codec: 'avc1.64002a', // Baseline / High Profile
-      description: data,
-      optimizeForLatency: true
-    });
-    return;
+  if (isConfig && decoder.state !== 'configured') {
+    // Build the codec string from the SPS rather than hardcoding one. The SPS
+    // payload carries profile_idc, constraint flags and level_idc right after
+    // its NAL header, and a mismatch between the declared codec and the actual
+    // stream makes Chrome refuse the configuration.
+    let codec = 'avc1.42E01E'; // baseline fallback
+    for (let i = 0; i < Math.min(data.length - 8, 32); i++) {
+      const sc = data[i + 2] === 1 ? 3 : (data[i + 2] === 0 && data[i + 3] === 1 ? 4 : 0);
+      if (sc && (data[i + sc] & 0x1f) === 7) {
+        const p = data[i + sc + 1], c = data[i + sc + 2], l = data[i + sc + 3];
+        const hex = (n) => n.toString(16).padStart(2, '0').toUpperCase();
+        codec = 'avc1.' + hex(p) + hex(c) + hex(l);
+        break;
+      }
+    }
+    // NO description: with it absent, WebCodecs treats input as Annex-B, which
+    // is exactly what scrcpy emits (4-byte start codes, in-band SPS/PPS).
+    // Passing the raw SPS here instead would declare AVCC and break decode.
+    decoder.configure({ codec, optimizeForLatency: true });
+    status.innerText = 'live · ' + codec;
+    status.style.color = '#4caf50';
   }
 
   if (decoder.state === 'configured') {
     try {
       decoder.decode(new EncodedVideoChunk({
-        type: isKey ? 'key' : 'delta',
+        type: isKey || isConfig ? 'key' : 'delta',
         timestamp: performance.now() * 1000,
         data: data
       }));

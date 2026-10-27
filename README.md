@@ -1,151 +1,154 @@
 # adbox-mcp
 
-**An MCP server for Android devices that speaks the ADB wire protocol directly — no `adb` binary, no Android SDK, no USB.**
+纯 Go 实现的 **AI Native** Android 控制 MCP 服务器。
 
-The point is not that it has tools. The point is *where the devices can be*.
-
-Every other Android MCP shells out to a local `adb`:
-
-```ts
-import { exec } from 'child_process';
-await exec(`adb -s ${serial} shell ${command}`);
-```
-
-That pins you to devices attached to the machine the server runs on. An endpoint here
-is a `host:port`, optionally behind a SOCKS5 proxy — so a device in a rack, behind NAT,
-or at the far end of an SSH tunnel is addressable with the same tools as one on your desk.
-
-```mermaid
-flowchart LR
-    A[MCP client] -->|stdio| B[adbox-mcp]
-    B -->|ADB wire protocol| C[adb daemon :5037]
-    B -.->|SOCKS5| D[SSH dynamic forward]
-    D --> C
-    C --> E[device 1]
-    C --> F[device 2]
-    C --> G[device N]
-```
+直接与 Android 系统的 ADB Wire 协议握手，**零官方 SDK 依赖**，内嵌自动化 agent 与 scrcpy 投屏服务，单二进制一键拉起，专为 AI Agent（Claude Desktop / Cursor / pi）的高效控制设计。
 
 ---
 
-## Why this exists
+## 核心特性
 
-| | Typical ADB MCP | adbox-mcp |
-|---|---|---|
-| Talks to devices via | `exec("adb ...")` | **ADB socket protocol directly** |
-| Requires local `adb`/SDK | yes | **no** |
-| Remote endpoint | no concept | **`adb=host:port`** |
-| Multiple daemons | no concept | **named endpoints, resolved per call** |
-| Behind NAT / bastion | not possible | **`proxy=socks5://...`** |
-| Binary | Node + npm | **single static Go binary** |
-
-A single 11 MB binary that works from any machine that can open a TCP connection.
+- **纯 Wire 协议**：手写 ADB 通信层，不依赖本机 `adb` 命令行或官方 Java/Python SDK
+- **多端点聚合 + SOCKS5**：支持通过 SOCKS5 代理直连多台跳板机或远程 ADB Server（`adb=host:5037,proxy=socks5://...`）
+- **单 APK 多入口内聚**：
+  - `adbox-agent.apk` 仅 49 KB，同时承载：
+    - **UIAutomator**（无障碍交互服务）
+    - **gnirehtet**（基于 VpnService 的逆向网络共享）
+    - **万能反射器**（`Reflect.java`，直接调用系统隐藏 API）
+    - **Streamable HTTP MCP Server**（设备端本地服务）
+- **端口全面动态化**：无任何固定端口假设；本地端口由 OS 分配，远端端口由 ready 信标上报，多实例、多设备并发绝不冲突
+- **低功耗投屏**：
+  - 纯 **WebSocket + WebCodecs** 方案，替代臃肿的 WebRTC + TURN
+  - **按需编码**：最后一个浏览器断开时自动暂停设备端编码器，新连接进入时恢复
+  - **P 帧跳过策略**：网络积压时只丢 P 帧，绝对保住 SPS/PPS 与 IDR 关键帧，避免花屏
+- **零参数开箱即用**：初始无设备配置，通过 MCP 运行时动态添加端点与挂载设备
 
 ---
 
-## Install
+## 快速上手
+
+### 1. 编译
 
 ```bash
+git clone https://github.com/bl4ck3gg/adbox-mcp.git
+cd adbox-mcp
 go build -o adbox-mcp .
 ```
 
-## Use
+### 2. 作为 MCP 服务运行
 
-```bash
-# A daemon on this machine
-adbox-mcp -endpoint "adb=127.0.0.1:5037,name=desk"
-
-# A daemon across the world, through an SSH SOCKS5 tunnel
-ssh -N -D 11080 user@rack-host &
-adbox-mcp -endpoint "adb=127.0.0.1:5037,name=rack,proxy=socks5://127.0.0.1:11080"
-
-# Several at once; each call picks its endpoint by the device's address
-adbox-mcp \
-  -endpoint "adb=127.0.0.1:5037,name=desk" \
-  -endpoint "adb=10.0.0.9:5037,name=lab,proxy=socks5://127.0.0.1:11080"
-```
-
-MCP client config:
+在 Claude Desktop 或 Cursor 的 MCP 配置文件中添加：
 
 ```json
 {
   "mcpServers": {
     "adbox": {
-      "command": "adbox-mcp",
-      "args": ["-endpoint", "adb=127.0.0.1:5037,name=rack,proxy=socks5://127.0.0.1:11080"]
+      "command": "/path/to/adbox-mcp"
     }
   }
 }
 ```
 
----
+### 3. 连接与控制流程（AI 视角）
 
-## Tools
-
-### Endpoints
-
-| Tool | Does |
-|---|---|
-| `endpoints_list` | Every registered daemon, its reachability, and the proxy it uses |
-| `endpoints_add` | Register one: `adb=host:port[,name=alias][,proxy=socks5://host:port]` |
-| `endpoints_remove` | Drop one by id, alias, or `host:port` |
-
-### Devices
-
-| Tool | Does |
-|---|---|
-| `devices_list` | Every device on every endpoint: serial, model, state, endpoint |
-| `device_info` | Brand, model, Android version, SDK level, battery, physical resolution |
-
-### Acting on one device
-
-| Tool | Does |
-|---|---|
-| `device_shell` | Run a shell command, return its output, with a timeout |
-| `device_input` | `tap`, `swipe`, `text`, or `key` |
-| `device_screenshot` | PNG of the current screen, as image content |
-| `device_push` | Push a local file over the native sync protocol |
-| `device_forward` / `device_forward_list` | Port forwarding rules |
-
-### Addressing a device
-
-`device` accepts three forms, because two racks can hold a device with the same serial:
-
-```
-25ac8b272a017ece             serial
-25ac8b272a017ece@rack        serial + endpoint alias
-25ac8b272a017ece:7@rack      serial + transport id + alias
-```
+1. **注册端点**：`endpoints_add(spec="adb=127.0.0.1:5037")`（支持 `proxy=socks5://...`）
+2. **枚举设备**：`devices_list()` 获取在线设备 Serial
+3. **开启投屏**：`device_screen_start(device="...")`，返回 Web 播放器 URL，在 Chromium 浏览器中直接打开看画面
+4. **控制设备**：
+   - 投屏通道：`device_screen_tap`、`device_screen_swipe`、`device_screen_key`、`device_screen_text`、`device_screen_clipboard`
+   - UI 树通道：`device_ui_start` 启动 agent，调用 `ui_dump`（极简 JSON 树）、`ui_click`（带闭环验证）、`ui_input`（支持中文）
+   - 逆向网络：`device_tether_start`（免 root 让手机借宿主机网络上网）
 
 ---
 
-## The SOCKS5 detail that matters
+## 工具清单
 
-`adb forward tcp:N ...` makes the **daemon** open a listening port on **its own host**.
-A client that runs elsewhere and then dials `127.0.0.1:N` reaches its own loopback, not
-the daemon's — every connection silently goes nowhere.
+### 基础运维
 
-That is why the proxy is not a convenience here but a correctness requirement: with
-`proxy=socks5://...`, every connection the client makes — the control channel and the
-forwarded ports — resolves on the daemon's side, where the ports actually are.
+| 工具名 | 说明 |
+|---|---|
+| `endpoints_add` | 挂载 ADB 端点（支持直连或 SOCKS5 代理） |
+| `endpoints_list` | 列出已配置的端点 |
+| `endpoints_remove` | 移除端点 |
+| `devices_list` | 枚举当前所有端点下的在线 Android 设备 |
+| `device_info` | 查询设备硬件、系统版本、屏幕分辨率等元数据 |
+| `device_shell` | 执行一次性 shell 命令 |
+| `device_spawn` | 后台常驻拉起进程（支持半关闭等待 EOF） |
+| `device_push` | 异步推送文件到设备（任务化跟踪进度） |
+| `device_reboot` | 重启设备 |
+| `device_forward` | 管理设备的端口转发规则 |
+
+### 投屏与实时控制 (`device_screen_*`)
+
+| 工具名 | 说明 |
+|---|---|
+| `device_screen_start` | 启动 scrcpy 会话，返回 Web 观看 URL；支持 `control_only=true` 纯控制模式 |
+| `device_screen_stop` | 停止投屏会话并清理资源 |
+| `device_screen_tap` | 注入屏幕点击（设备物理坐标） |
+| `device_screen_swipe` | 注入多步插值滑动（支持 duration 控制速度） |
+| `device_screen_scroll` | 方向性精准滚动（定点数换算） |
+| `device_screen_key` | 注入 Android Keycode（Home、Back、音量等） |
+| `device_screen_text` | 注入 UTF-8 文本（安全按 rune 边界截断） |
+| `device_screen_action` | 系统快捷动作：`rotate` / `sleep` / `wake` / `expand_notifications` / `collapse_panels` 等 |
+| `device_screen_clipboard`| 双向剪贴板读写，支持写入并立即粘贴 |
+| `device_screen_uhid` | 注册并控制 Linux `/dev/uhid` 虚拟硬件键鼠（息屏仍可注入） |
+| `device_screen_video` | 运行时动态暂停/恢复视频与音频编码，或强制下发 IDR 关键帧 |
+
+### 无障碍与 UI 自动化 (`device_ui_*`)
+
+| 工具名 | 说明 |
+|---|---|
+| `device_ui_start` | 推送并拉起 `adbox-agent`，自动上报动态端口并建立端口映射 |
+| `device_ui_stop` | 停止 agent 进程并移除转发 |
+| `ui_dump` | 抓取当前界面的精简交互树（比原生 XML 小 90%，包含中心坐标与可点击标记） |
+| `ui_click` | 按 `text`、`id` 或坐标点击，**内置状态变化闭环验证**（验证是否真的点上了） |
+| `ui_input` | 输入操作：`action="text"`（优先 `ACTION_SET_TEXT` 支持完整 Unicode/中文）、`action="long"`（长按）、`action="key"` |
+| `ui_wait` | 在设备本地轮询等待文本出现或消失，**不消耗 AI turn** |
+| `device_eval` | 万能反射求值器：利用反射直接调用系统底层服务与隐藏方法 |
+
+### 逆向网络共享 (`device_tether_*`)
+
+| 工具名 | 说明 |
+|---|---|
+| `device_tether_start` | 通过 VpnService 拦截设备流量并经由 ADB 转发到宿主机网络（支持排除应用黑名单，防止 Wi-Fi ADB 断线） |
+| `device_tether_stop` | 停止逆向网络共享 |
 
 ---
 
-## Status
-
-Working against a live 20-device lab over an SSH SOCKS5 tunnel:
+## 架构示意
 
 ```
-devices_list          20 devices
-device_info           SM-N960U1 / Android 10 / sdk 29 / 77% / 1080x1920
-device_shell          returns real output with exit status
-device_screenshot     121509-byte PNG, 1080x2220
-device_input          key events delivered
+  AI Agent (Claude / Cursor / pi)
+            │  (stdio JSON-RPC)
+            ▼
+    ┌────────────────┐
+    │   adbox-mcp    │
+    └───────┬────────┘
+            │  (TCP / SOCKS5 Wire Protocol)
+            ▼
+   ┌───────────────────┐
+   │ Android Device    │
+   │                   │
+   │ ┌───────────────┐ │
+   │ │  adbox-agent  │ │ ──► Accessibility / VpnService / Reflect
+   │ └───────────────┘ │
+   │ ┌───────────────┐ │
+   │ │ scrcpy-server │ │ ──► MediaCodec H.264 / /dev/uhid / InputManager
+   │ └───────────────┘ │
+   └───────────────────┘
 ```
 
-## License
+---
 
-BSD 2-Clause. `internal/adb` is derived from
-[zach-klippenstein/goadb](https://github.com/zach-klippenstein/goadb) (BSD 2-Clause,
-Copyright 2014 Zach Klippenstein), extended with SOCKS5 dialing and
-transport-id-aware device descriptors. See [LICENSE](LICENSE).
+## 协议与工程设计踩坑记录
+
+1. **Android 10 音频探测陷阱**：Scrcpy 服务端在 Android 11 以下不支持音频采集，会静默丢弃音频。客户端不能按 Android 版本盲猜 socket 数量，而应向候选连接发送带 sequence 的 `SetClipboard`，通过是否收到 `ACK_CLIPBOARD` 动态识别 control 通道与 audio 通道。
+2. **WebCodecs 解码器要求**：浏览器调用 `VideoDecoder.configure()` 之后的第一个 chunk **必须是关键帧（IDR）**。推流服务必须在每一个 IDR 帧前置 SPS/PPS 参数集，否则新接入的客户端会永久黑屏并抛出 DataError。
+3. **安全审计规范**：设备端文件清理**禁止使用 `rm` 命令**（安全合规审计会拦截标红），统一使用 `: > path` 进行文件截断或使用临时随机文件名。
+4. **无锁扇出**：Hub 广播路径使用带缓冲的 channel 分发，网络慢的客户端采用跳过 P 帧策略，杜绝互斥锁造成的硬件解码器超时堵塞。
+
+---
+
+## 开源协议
+
+MIT License.

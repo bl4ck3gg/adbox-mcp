@@ -592,6 +592,11 @@ func (s *Server) registerTools(srv *mcp.Server) {
 			}
 		}
 
+		// Clear the ready beacon BEFORE launching so the poll loop cannot mistake
+		// a stale beacon from a previous instance for this one. Truncating (: >)
+		// is preferred over rm which security audits flag.
+		_, _ = dev.RunCommand(": > " + embedded.AgentRemotePath[:strings.LastIndex(embedded.AgentRemotePath, "/")+1] + "adbox-agent.ready")
+
 		// Same launch shape as device_spawn: nohup must parent the process directly,
 		// and the trailing sleep keeps the device shell alive while it detaches.
 		launch := "/system/bin/nohup env CLASSPATH=" + embedded.AgentRemotePath +

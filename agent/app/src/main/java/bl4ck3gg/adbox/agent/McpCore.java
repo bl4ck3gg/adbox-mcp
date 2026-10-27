@@ -103,8 +103,11 @@ public class McpCore {
                 "inputSchema": {
                   "type": "object",
                   "properties": {
-                    "action":    {"type": "string", "enum": ["text", "key", "swipe"]},
-                    "text":      {"type": "string", "description": "ASCII text to type, for action=text"},
+                    "action":    {"type": "string", "enum": ["text", "key", "swipe", "long"]},
+                    "text":      {"type": "string", "description": "Text to enter, for action=text. Any Unicode: uses ACTION_SET_TEXT on the focused field, falling back to keycodes only when nothing is focused."},
+                    "x":         {"type": "integer", "description": "For action=long"},
+                    "y":         {"type": "integer", "description": "For action=long"},
+                    "duration_ms": {"type": "number", "description": "For action=long, default 800"},
                     "key":       {"type": "string", "description": "home, back, enter, recent, or a numeric keycode"},
                     "direction": {"type": "string", "enum": ["up", "down", "left", "right"], "description": "For action=swipe"}
                   },
@@ -218,16 +221,62 @@ public class McpCore {
                 .put("changes", changes);
     }
 
+/**
+     * Sets the text of the focused editable node via ACTION_SET_TEXT.
+     *
+     * This is the only path that can type text a keyboard could not produce.
+     * It also replaces the field content instead of appending, which is what
+     * makes it usable for clearing a search box.
+     *
+     * Returns false when no editable node has focus, so the caller can fall back
+     * to keycodes on screens with no text field.
+     */
+    private boolean setTextOnFocused(String text) {
+        try {
+            android.view.accessibility.AccessibilityNodeInfo root = automation.getRootInActiveWindow();
+            if (root == null) {
+                return false;
+            }
+            android.view.accessibility.AccessibilityNodeInfo focused = root.findFocus(
+                    android.view.accessibility.AccessibilityNodeInfo.FOCUS_INPUT);
+            if (focused == null) {
+                return false;
+            }
+            android.os.Bundle b = new android.os.Bundle();
+            b.putCharSequence(
+                    android.view.accessibility.AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                    text);
+            return focused.performAction(
+                    android.view.accessibility.AccessibilityNodeInfo.ACTION_SET_TEXT, b);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private boolean doInput(JSONObject args) {
         String action = args.optString("action", "");
         switch (action) {
             case "text": {
+                String text = args.optString("text", "");
+                // ACTION_SET_TEXT first: it carries the string itself, so CJK,
+                // emoji and punctuation all arrive intact. The keycode loop below
+                // can only express what a physical keyboard could produce, which
+                // silently drops everything else.
+                if (setTextOnFocused(text)) {
+                    return true;
+                }
                 boolean any = false;
-                for (char c : args.optString("text", "").toCharArray()) {
+                for (char c : text.toCharArray()) {
                     int code = charToKeyCode(c);
                     if (code != 0) any |= actions.key(code);
                 }
                 return any;
+            }
+            case "long": {
+                return actions.longClick(
+                        args.optInt("x", 0),
+                        args.optInt("y", 0),
+                        (long) (args.optDouble("duration_ms", 800)));
             }
             case "key": {
                 switch (args.optString("key", "").toLowerCase()) {

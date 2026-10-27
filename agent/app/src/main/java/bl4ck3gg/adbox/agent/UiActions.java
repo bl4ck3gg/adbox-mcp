@@ -56,6 +56,29 @@ public class UiActions {
         }
     }
 
+/**
+     * Long-presses a point.
+     *
+     * There is no framework primitive for a long press, only the timing of the
+     * release: the gesture recogniser decides from how long the DOWN lived. So the
+     * duration is real wall-clock time spent between the two events rather than a
+     * parameter handed to the system.
+     */
+    public boolean longClick(int x, int y, long durationMs) {
+        if (durationMs <= 0) {
+            durationMs = 800; // the platform's own default threshold is 500ms
+        }
+        long down = SystemClock.uptimeMillis();
+        try {
+            automation.injectInputEvent(motion(down, down, MotionEvent.ACTION_DOWN, x, y), true);
+            SystemClock.sleep(durationMs);
+            automation.injectInputEvent(motion(down, down + durationMs, MotionEvent.ACTION_UP, x, y), true);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /** Swipes between two points over the given duration. */
     public boolean swipe(int x1, int y1, int x2, int y2, long durationMs) {
         long down = SystemClock.uptimeMillis();

@@ -125,15 +125,37 @@ func (m *Manager) AddEndpoint(spec string) (string, error) {
 		Port: port,
 	}
 
+	// The proxy field carries the transport, and the two transports answer
+	// different questions. socks5:// routes through a proxy that is already
+	// running. ssh:// opens an SSH session and dials through it, which is how a
+	// device that can only dial outward becomes reachable -- nothing needs to
+	// listen on the phone's network.
 	if proxyURL != "" {
-		if !strings.HasPrefix(proxyURL, "socks5://") {
-			return "", fmt.Errorf("proxy must start with socks5:// (got %q)", proxyURL)
+		switch {
+		case strings.HasPrefix(proxyURL, "socks5://"):
+			dialer, err := adb.NewSOCKS5Dialer(proxyURL)
+			if err != nil {
+				return "", fmt.Errorf("socks5 dialer: %w", err)
+			}
+			cfg.Dialer = dialer
+
+		case strings.HasPrefix(proxyURL, "ssh://"):
+			sshOpts, err := adb.ParseSSHSpec(proxyURL)
+			if err != nil {
+				return "", fmt.Errorf("ssh spec: %w", err)
+			}
+			if sshOpts.KeyPath == "" && sshOpts.Password == "" {
+				return "", fmt.Errorf("ssh endpoint needs ?key=<path> or ?password=<pass>: an interactive prompt is not possible here")
+			}
+			dialer, err := adb.NewSSHDialer(sshOpts)
+			if err != nil {
+				return "", fmt.Errorf("ssh dialer: %w", err)
+			}
+			cfg.Dialer = dialer
+
+		default:
+			return "", fmt.Errorf("proxy must start with socks5:// or ssh:// (got %q)", proxyURL)
 		}
-		dialer, err := adb.NewSOCKS5Dialer(proxyURL)
-		if err != nil {
-			return "", fmt.Errorf("socks5 dialer: %w", err)
-		}
-		cfg.Dialer = dialer
 	}
 
 	client, err := adb.NewWithConfig(cfg)

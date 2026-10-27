@@ -152,3 +152,44 @@ go build -o adbox-mcp .
 ## 开源协议
 
 MIT License.
+
+---
+
+## 远程穿透：基于 SSH 的植入通道
+
+adbox-mcp 原生支持以 SSH 为传输隧道（`proxy=ssh://...`），使得在 NAT 后面、4G/5G 蜂窝网络下的手机无需公网 IP 和端口映射也能被纳管。
+
+### 语法
+
+```json
+{
+  "spec": "adb=127.0.0.1:5555,proxy=ssh://root@jumpbox.example.com:22?key=~/.ssh/id_ed25519"
+}
+```
+
+- **免密私钥**：`?key=/path/to/id_rsa`（支持 `~/` 路径自动展开）
+- **密码认证**：`?password=your_secret`
+- **动态免密防拦截**：`?insecure=1`（跳过 host key 检查，适合刷机后 host key 频繁变动的手机）
+
+### 手机侧部署 sshd（三种形态）
+
+1. **静态编译 Dropbear（推荐，免 root 零依赖）**：
+   - 将编译好的 `dropbear` 静态二进制推入 `/data/local/tmp/`
+   - 使用 `dropbearkey` 在本地生成主机密钥：`/data/local/tmp/dropbearkey -t ed25519 -f /data/local/tmp/host_key`
+   - 后台运行：`/data/local/tmp/dropbear -p 2222 -r /data/local/tmp/host_key -F`
+   - 手机即可作为原生 SSH 端点接入。
+
+2. **反向 SSH 隧道（手机主动外联，彻底穿透 NAT）**：
+   - 手机侧不需要监听公网端口，只需通过蜂窝网络外联你的中转服务器：
+     ```bash
+     ssh -N -R 5555:127.0.0.1:5555 user@your-server.com
+     ```
+   - adbox-mcp 侧直接配置：
+     ```bash
+     endpoints_add(spec="adb=127.0.0.1:5555,proxy=ssh://user@your-server.com")
+     ```
+   - 手机断网自动重连，无需动态域名和防火墙打洞。
+
+3. **Termux OpenSSH（开箱即用）**：
+   - 安装 Termux，执行 `pkg install openssh && sshd -p 8022`
+   - 将宿主机公钥写入 `~/.ssh/authorized_keys` 即可。

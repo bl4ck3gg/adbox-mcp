@@ -33,7 +33,8 @@ type Hub struct {
 	lastKey atomic.Pointer[[]byte]
 	width    atomic.Int32
 	height   atomic.Int32
-	rotation atomic.Int32
+	rotation   atomic.Int32
+	audioCodec atomic.Int32
 }
 
 func newHub() *Hub {

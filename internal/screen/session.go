@@ -2,6 +2,7 @@ package screen
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,7 +30,15 @@ type Session struct {
 	remoteJar string
 	maxSize    int
 	bitRate    int
-	viewerPort int
+	viewerPort  int
+	enableAudio bool
+	uhidOn      atomic.Bool
+	audioActive atomic.Bool
+	audioConn   atomic.Pointer[net.Conn]
+	firstFrame  chan struct{}
+	probeReply  chan net.Conn
+	frameOnce   sync.Once
+	videoOn     atomic.Bool
 
 	running   atomic.Bool
 	hub       *Hub
@@ -59,7 +69,7 @@ func NewSession(dev *adb.Device, serial string, maxSize, bitRate, viewerPort int
 		bitRate = 4000000
 	}
 	scid := scidCounter.Add(1) & 0x7fffffff
-	return &Session{
+	se := &Session{
 		dev:       dev,
 		serial:    serial,
 		scid:      scid,
@@ -69,6 +79,9 @@ func NewSession(dev *adb.Device, serial string, maxSize, bitRate, viewerPort int
 		viewerPort: viewerPort,
 		hub:        newHub(),
 	}
+	se.videoOn.Store(true)
+	se.firstFrame = make(chan struct{})
+	return se
 }
 
 func (s *Session) Start() (webUrl string, err error) {
@@ -94,10 +107,25 @@ func (s *Session) Start() (webUrl string, err error) {
 	_, _ = s.dev.RunCommand("pkill -f " + embedded.ScrcpyMainClass)
 	time.Sleep(200 * time.Millisecond)
 
-	// 3. Launch scrcpy-server via app_process
+	// 3. Launch scrcpy-server via app_process.
+	//
+	// Audio is requested unconditionally and the socket layout is discovered
+	// afterwards rather than predicted from the API level.
+	//
+	// Scrcpy disables audio capture below Android 11 (API 30) -- the
+	// AudioPlaybackCapture API is not usable there -- and the accept order is
+	// fixed at video, audio, control. So on a device that silently dropped audio
+	// the server accepts only TWO sockets, and a client that assumed three
+	// would park its control channel in the audio slot and its enable-video
+	// message would land nowhere: sockets all connect, nothing streams.
+	//
+	// Guessing from ro.build.version.sdk fixes that for the versions we know
+	// about and breaks for every other reason audio can fail (a build with audio
+	// stripped, a codec the device lacks, a future API bump). So request it,
+	// then probe which layout actually happened and adapt.
 	socketName := fmt.Sprintf("scrcpy_%08x", s.scid)
 	maxLong := s.maxSize &^ 7
-	launchCmd := fmt.Sprintf("/system/bin/nohup env CLASSPATH=%s app_process / %s %s scid=%08x log_level=debug tunnel_forward=true audio=false max_size=%d video_bit_rate=%d max_fps=30 video_codec_options=i-frame-interval=1 >/dev/null 2>&1 </dev/null &",
+	launchCmd := fmt.Sprintf("/system/bin/nohup env CLASSPATH=%s app_process / %s %s scid=%08x log_level=debug tunnel_forward=true audio=true audio_codec=opus audio_source=output max_size=%d video_bit_rate=%d max_fps=30 video_codec_options=i-frame-interval=1 >/dev/null 2>&1 </dev/null &",
 		s.remoteJar, embedded.ScrcpyMainClass, embedded.ScrcpyVersion, s.scid, maxLong, s.bitRate)
 
 	if err := s.dev.RunInteractiveShellLinesFireAndClose([]string{launchCmd, "sleep 1"}); err != nil {
@@ -113,42 +141,96 @@ func (s *Session) Start() (webUrl string, err error) {
 		return "", fmt.Errorf("forward scrcpy socket: %w", err)
 	}
 
-	// 5. Connect Video Socket
+	// 5. Video socket. Always first, and it is the only one that gets a dummy
+	//    byte, so receiving it proves the server is up and the order is right.
 	videoConn, err := s.dev.DialRemote("127.0.0.1", fwdPort)
 	if err != nil {
 		return "", fmt.Errorf("dial video socket: %w", err)
 	}
-
-	// Dummy byte on first socket
 	dummy := make([]byte, 1)
 	if _, err := io.ReadFull(videoConn, dummy); err != nil {
 		_ = videoConn.Close()
 		return "", fmt.Errorf("read video dummy: %w", err)
 	}
 
-	// 6. Connect Control Socket
-	controlConn, err := s.dev.DialRemote("127.0.0.1", fwdPort)
-	if err != nil {
-		_ = videoConn.Close()
-		return "", fmt.Errorf("dial control socket: %w", err)
-	}
-	s.controlConn.Store(&controlConn)
-
-	// Enable video encoding (scrcpy extension requirement)
-	if _, err := controlConn.Write([]byte{18, 1}); err != nil {
-		_ = videoConn.Close()
-		_ = controlConn.Close()
-		return "", fmt.Errorf("enable video: %w", err)
-	}
-
-	// 7. Start fanout hub loop (pure channel-based)
+	// 6. Start the demuxer before probing, so "did a frame arrive" is an
+	//    observable signal rather than a guess.
+	s.running.Store(true)
 	go s.hub.Run()
+	go s.readVideoLoop(videoConn)
 
-	// Drain device messages for the life of the session. Not doing this backs up
-	// the control socket and stalls clipboard and geometry updates.
-	go s.readControlLoop(controlConn)
+	// 7. Discover which connection is the control socket.
+	//
+	// The server accepts video, then optionally audio, then control, so after the
+	// video socket the next connections are (audio?, control). Whether audio
+	// exists depends on the build and the API level, and guessing from either is
+	// how a wrong assumption turns into "sockets connect but nothing streams".
+	//
+	// Probe instead: send a clipboard request on each candidate and see which one
+	// answers. It is idempotent, tiny, and harmless if it lands on the audio
+	// socket (whose input the server never reads). Enable-video is NOT safe to
+	// probe with -- writing it into the audio slot corrupts the audio stream and
+	// the encoder never starts.
+	first := mustDial(s.dev, fwdPort)
+	if first == nil {
+		_ = videoConn.Close()
+		return "", fmt.Errorf("dial control candidate 1")
+	}
+	second := mustDial(s.dev, fwdPort)
+	if second == nil {
+		_ = videoConn.Close()
+		_ = first.Close()
+		return "", fmt.Errorf("dial control candidate 2")
+	}
 
-	// 8. Start HTTP viewer server
+	reply := make(chan net.Conn, 2)
+	s.probeReply = reply
+	go s.readControlLoop(first)
+	go s.readControlLoop(second)
+
+	// SetClipboard with sequence != 0 produces an ACK_CLIPBOARD device message
+	// unconditionally (GetClipboard returns nothing when autosync is on). The
+	// audio socket accepts no control frames and will never answer.
+	probePkt := SetClipboard(1, "", false)
+	_, _ = first.Write(probePkt)
+	_, _ = second.Write(probePkt)
+
+	var control net.Conn
+	select {
+	case control = <-reply:
+	case <-time.After(1500 * time.Millisecond):
+	}
+
+	if control == nil {
+		// Neither answered. That happens when the server accepted fewer sockets
+		// than we dialed and one candidate is parked in the backlog, or when the
+		// clipboard path is unavailable on this build. Fall back to the layout
+		// scrcpy uses when audio is off: the first candidate is control.
+		slog.Warn("screen: no clipboard reply, assuming two-socket layout", "device", s.serial)
+		control = first
+		_ = second.Close()
+		s.audioActive.Store(false)
+	} else if control == first {
+		slog.Info("screen: audio unavailable (two sockets)", "device", s.serial)
+		_ = second.Close()
+		s.audioActive.Store(false)
+	} else {
+		slog.Info("screen: audio active (three sockets)", "device", s.serial)
+		s.audioActive.Store(true)
+		s.audioConn.Store(&first)
+		go s.readAudioLoop(first)
+	}
+
+	s.probeReply = nil
+	s.controlConn.Store(&control)
+
+	// Enable video now that the control channel is known.
+	_, _ = control.Write([]byte{18, 1})
+	if !s.waitForFirstFrame(2500 * time.Millisecond) {
+		_, _ = control.Write([]byte{18, 1})
+	}
+
+	// 9. Start HTTP viewer server
 	bindHost := os.Getenv("ADBOX_SCREEN_HOST")
 	if bindHost == "" {
 		bindHost = "127.0.0.1"
@@ -160,21 +242,19 @@ func (s *Session) Start() (webUrl string, err error) {
 	ln, err := net.Listen("tcp", net.JoinHostPort(bindHost, portSpec))
 	if err != nil {
 		_ = videoConn.Close()
-		_ = controlConn.Close()
+		if cc := s.controlConn.Load(); cc != nil {
+			_ = (*cc).Close()
+		}
 		s.hub.Stop()
 		return "", fmt.Errorf("listen viewer: %w", err)
 	}
 	s.httpListener = ln
 	s.httpPort = ln.Addr().(*net.TCPAddr).Port
-	s.running.Store(true)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/ws", s.handleWS)
 	go http.Serve(ln, mux)
-
-	// 9. Start video demuxer loop
-	go s.readVideoLoop(videoConn)
 
 	webUrl = fmt.Sprintf("http://%s:%d/", bindHost, s.httpPort)
 	slog.Info("screen session started", "device", s.serial, "web", webUrl, "fwd", fwdPort)
@@ -310,7 +390,8 @@ func (s *Session) readVideoLoop(conn net.Conn) {
 		}
 
 		// Non-blocking fanout to all active browser channels
-		s.hub.Broadcast(out)
+		s.markFirstFrame()
+		s.hub.Broadcast(TagVideo(out))
 	}
 }
 
@@ -338,6 +419,7 @@ func (s *Session) readControlLoop(conn net.Conn) {
 	for s.running.Load() {
 		n, err := conn.Read(chunk)
 		if err != nil {
+			slog.Debug("screen: control read err", "err", err)
 			return
 		}
 		buf = append(buf, chunk[:n]...)
@@ -353,14 +435,39 @@ func (s *Session) readControlLoop(conn net.Conn) {
 			}
 			buf = buf[consumed:]
 
+			// Any valid device message identifies this connection as the control
+			// socket. Reported before the switch so every message type counts.
+			if ch := s.probeReply; ch != nil {
+				select {
+				case ch <- conn:
+				default:
+				}
+			}
+
 			switch ev.Type {
 			case devClipboard:
 				s.lastClipboard.Store(&ev.Text)
+				if info, err := json.Marshal(map[string]any{
+					"type": "clipboard",
+					"text": ev.Text,
+				}); err == nil {
+					s.hub.Broadcast(TagInfo(info))
+				}
 			case devDisplayGeometry:
 				s.hub.rotation.Store(int32(ev.Rotation))
 				if ev.Width > 0 && ev.Height > 0 {
 					s.hub.width.Store(int32(ev.Width))
 					s.hub.height.Store(int32(ev.Height))
+				}
+				// Tell viewers so the page can adjust its aspect box immediately
+				// instead of waiting for the next SPS with a new resolution.
+				if info, err := json.Marshal(map[string]any{
+					"type":     "geometry",
+					"rotation": ev.Rotation,
+					"width":    ev.Width,
+					"height":   ev.Height,
+				}); err == nil {
+					s.hub.Broadcast(TagInfo(info))
 				}
 			}
 		}
@@ -370,6 +477,15 @@ func (s *Session) readControlLoop(conn net.Conn) {
 // InjectTouch sends a touch event in VIDEO pixel coordinates, which the device
 // maps onto its real display using the width and height carried in the packet.
 func (s *Session) InjectTouch(action, x, y int) {
+	s.InjectTouchPointer(action, 0, x, y, 0xFFFF)
+}
+
+// InjectTouchPointer is InjectTouch with an explicit pointer id and pressure.
+//
+// Multi-touch is what makes pinch-to-zoom possible: two fingers are two pointer
+// ids moving at once, and the device only recognises a pinch when both are down
+// in the same gesture. Sending them as one pointer just pans.
+func (s *Session) InjectTouchPointer(action, pointerID, x, y, pressure int) {
 	w := int(s.hub.width.Load())
 	h := int(s.hub.height.Load())
 	if w <= 0 || h <= 0 {
@@ -379,7 +495,7 @@ func (s *Session) InjectTouch(action, x, y int) {
 	if action == ActionUp {
 		buttons = ButtonNone
 	}
-	s.InjectRawControl(InjectTouch(action, 0, x, y, w, h, 0xFFFF, buttons, buttons))
+	s.InjectRawControl(InjectTouch(action, pointerID, x, y, w, h, pressure, buttons, buttons))
 }
 
 // InjectSwipe drives a complete down-move-up gesture.
@@ -444,4 +560,250 @@ func (s *Session) RefreshClipboard() {
 func (s *Session) Tap(x, y int) {
 	s.InjectTouch(ActionDown, x, y)
 	s.InjectTouch(ActionUp, x, y)
+}
+
+// readAudioLoop consumes the audio stream and fans it out tagged as audio.
+//
+// The header is identical in shape to video: 8 bytes of PTS/flags then a 4-byte
+// size. The very first 4 bytes of the connection are the codec id, sent once.
+func (s *Session) readAudioLoop(conn net.Conn) {
+	defer conn.Close()
+
+	codecBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, codecBuf); err != nil {
+		return
+	}
+	codec := audioCodecFromID(binary.BigEndian.Uint32(codecBuf))
+	s.hub.audioCodec.Store(int32(codec))
+	slog.Info("screen audio codec", "codec", codec.String(), "device", s.serial)
+
+	// Tell viewers which codec to configure their AudioDecoder with.
+	if info, err := json.Marshal(map[string]any{
+		"type":  "audio-codec",
+		"codec": codec.String(),
+	}); err == nil {
+		s.hub.Broadcast(TagInfo(info))
+	}
+
+	header := make([]byte, 12)
+	for s.running.Load() {
+		if _, err := io.ReadFull(conn, header); err != nil {
+			return
+		}
+		size := binary.BigEndian.Uint32(header[8:12])
+		if size == 0 || size > 64*1024 {
+			continue
+		}
+		payload := make([]byte, size)
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return
+		}
+		s.hub.Broadcast(TagAudio(payload))
+	}
+}
+
+// ---- UHID ----------------------------------------------------------------
+
+// UhidIDs are the virtual device ids we register. They only need to be unique
+// within this connection.
+const (
+	uhidKeyboard = 1
+	uhidMouse    = 2
+)
+
+// EnableUhid registers a virtual keyboard and mouse on the device. This is the
+// path that works when injected InputEvents do not: screen off, hardware-keyboard
+// fields, and apps that filter synthetic input.
+func (s *Session) EnableUhid() error {
+	if s.uhidOn.Load() {
+		return nil
+	}
+	if err := s.probeUhid(); err != nil {
+		return err
+	}
+	s.InjectRawControl(UhidCreate(uhidKeyboard, 0x1234, 0x5678, "adbox keyboard", KeyboardReportDescriptor))
+	time.Sleep(80 * time.Millisecond)
+	s.InjectRawControl(UhidCreate(uhidMouse, 0x1234, 0x5679, "adbox mouse", MouseReportDescriptor))
+	time.Sleep(80 * time.Millisecond)
+	s.uhidOn.Store(true)
+	slog.Info("uhid devices registered", "device", s.serial)
+	return nil
+}
+
+// probeUhid checks the device actually exposes /dev/uhid to the shell user
+// before pretending the capability exists.
+func (s *Session) probeUhid() error {
+	out, err := s.dev.RunCommand("test -r /dev/uhid && echo OK || echo NO")
+	if err != nil {
+		return fmt.Errorf("probe /dev/uhid: %w", err)
+	}
+	if !strings.Contains(out, "OK") {
+		return fmt.Errorf("/dev/uhid is not readable by the shell user on this device")
+	}
+	return nil
+}
+
+// UhidKeyPress sends a key as a real HID scancode, down then up.
+// Returns false when the key has no scancode mapping, so the caller can fall
+// back to the keycode path.
+func (s *Session) UhidKeyPress(androidKeycode int) bool {
+	scan, ok := KeycodeToScancode[androidKeycode]
+	if !ok || !s.uhidOn.Load() {
+		return false
+	}
+	// 8-byte boot keyboard report: modifier, reserved, 6 scancodes
+	down := make([]byte, 8)
+	down[2] = scan
+	s.InjectRawControl(UhidInput(uhidKeyboard, down))
+	up := make([]byte, 8)
+	s.InjectRawControl(UhidInput(uhidKeyboard, up))
+	return true
+}
+
+// UhidTypeText sends text as HID scancodes, for fields that reject inject-text.
+func (s *Session) UhidTypeText(text string) bool {
+	if !s.uhidOn.Load() {
+		return false
+	}
+	for _, r := range text {
+		scan, ok := asciiToScancode(r)
+		if !ok {
+			return false
+		}
+		report := make([]byte, 8)
+		if r >= 'A' && r <= 'Z' {
+			report[0] = 0x02 // left shift
+		}
+		report[2] = scan
+		s.InjectRawControl(UhidInput(uhidKeyboard, report))
+		time.Sleep(12 * time.Millisecond)
+		s.InjectRawControl(UhidInput(uhidKeyboard, make([]byte, 8)))
+		time.Sleep(8 * time.Millisecond)
+	}
+	return true
+}
+
+// UhidMouseMove sends a relative mouse move with optional button state.
+func (s *Session) UhidMouseMove(dx, dy int, buttons byte) bool {
+	if !s.uhidOn.Load() {
+		return false
+	}
+	report := []byte{buttons, byte(int8(clampInt(dx, -127, 127))), byte(int8(clampInt(dy, -127, 127))), 0}
+	s.InjectRawControl(UhidInput(uhidMouse, report))
+	return true
+}
+
+// UhidMouseClick clicks at the current pointer position.
+func (s *Session) UhidMouseClick() bool {
+	if !s.uhidOn.Load() {
+		return false
+	}
+	s.InjectRawControl(UhidInput(uhidMouse, []byte{0x01, 0, 0, 0}))
+	time.Sleep(20 * time.Millisecond)
+	s.InjectRawControl(UhidInput(uhidMouse, []byte{0x00, 0, 0, 0}))
+	return true
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// asciiToScancode maps printable ASCII to USB HID usage ids (0x04..0x38 range).
+func asciiToScancode(r rune) (byte, bool) {
+	switch {
+	case r >= 'a' && r <= 'z':
+		return byte(0x04 + (r - 'a')), true
+	case r >= 'A' && r <= 'Z':
+		return byte(0x04 + (r - 'A')), true
+	case r >= '1' && r <= '9':
+		return byte(0x1e + (r - '1')), true
+	case r == '0':
+		return 0x27, true
+	case r == '\n':
+		return 0x28, true
+	case r == ' ':
+		return 0x2c, true
+	case r == '-':
+		return 0x2d, true
+	case r == '=':
+		return 0x2e, true
+	case r == '[':
+		return 0x2f, true
+	case r == ']':
+		return 0x30, true
+	case r == '\\':
+		return 0x31, true
+	case r == ';':
+		return 0x33, true
+	case r == '\'':
+		return 0x34, true
+	case r == '`':
+		return 0x35, true
+	case r == ',':
+		return 0x36, true
+	case r == '.':
+		return 0x37, true
+	case r == '/':
+		return 0x38, true
+	}
+	return 0, false
+}
+
+// SetVideoEnabled stops or resumes encoding without restarting the process.
+// Useful when a viewer goes away and the device should stop burning power on an
+// encoder nobody is watching.
+func (s *Session) SetVideoEnabled(on bool) {
+	s.InjectRawControl(SetVideoEnabled(on))
+	s.videoOn.Store(on)
+}
+
+// VideoEnabled reports the last state we asked the encoder for.
+func (s *Session) VideoEnabled() bool { return s.videoOn.Load() }
+
+// UhidEnabled reports whether virtual HID devices are registered.
+func (s *Session) UhidEnabled() bool { return s.uhidOn.Load() }
+
+// RequestKeyFrame asks the encoder to emit an IDR now. A viewer that fell behind
+// or a decoder that lost state recovers on the next keyframe rather than waiting
+// for the one-second GOP to come around.
+func (s *Session) RequestKeyFrame() {
+	s.InjectRawControl(ResetVideo())
+}
+
+// waitForFirstFrame blocks until the demuxer has produced a frame, which is the
+// only honest proof that the socket we sent enable-video on is the control one.
+func (s *Session) waitForFirstFrame(d time.Duration) bool {
+	select {
+	case <-s.firstFrame:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// markFirstFrame is called once by the demuxer.
+func (s *Session) markFirstFrame() {
+	s.frameOnce.Do(func() {
+		if s.firstFrame != nil {
+			close(s.firstFrame)
+		}
+	})
+}
+
+// AudioActive reports whether the device actually accepted an audio socket.
+// It is discovered at start time, not predicted from the API level.
+func (s *Session) AudioActive() bool { return s.audioActive.Load() }
+
+func mustDial(dev *adb.Device, port int) net.Conn {
+	c, err := dev.DialRemote("127.0.0.1", port)
+	if err != nil {
+		return nil
+	}
+	return c
 }

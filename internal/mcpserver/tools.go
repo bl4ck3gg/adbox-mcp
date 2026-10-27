@@ -290,6 +290,65 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		return textResult(map[string]any{"device": rec.Serial, "written": len(args.Text), "pasted": args.Paste, "ok": true})
 	})
 
+	type screenInputArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+		Mode   string `json:"mode" jsonschema:"enable | disable | status — virtual HID keyboard and mouse"`
+	}
+	handle(srv, &mcp.Tool{
+		Name: "device_screen_uhid",
+		Description: "Register virtual HID keyboard and mouse on the device. This path works where injected " +
+			"InputEvents do not: with the panel off, in fields that demand real hardware input, and in apps " +
+			"that filter synthetic events. Requires /dev/uhid readable by the shell user.",
+	}, func(ctx context.Context, args screenInputArgs) (*mcp.CallToolResult, error) {
+		_, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("no active screen session for %s", rec.Serial)
+		}
+		switch args.Mode {
+		case "status":
+			return textResult(map[string]any{"device": rec.Serial, "uhid": sess.UhidEnabled()})
+		case "disable", "":
+			return textResult(map[string]any{"device": rec.Serial, "uhid": sess.UhidEnabled(), "note": "devices stay registered for the session lifetime"})
+		case "enable":
+			if err := sess.EnableUhid(); err != nil {
+				return errResult("enable uhid: %v", err)
+			}
+			return textResult(map[string]any{"device": rec.Serial, "uhid": true})
+		}
+		return errResult("unknown mode %q", args.Mode)
+	})
+
+	type screenVideoArgs struct {
+		Device  string `json:"device" jsonschema:"Device serial"`
+		Enabled *bool  `json:"enabled,omitempty" jsonschema:"true resumes encoding, false stops it. Omit to query."`
+		Keyframe bool  `json:"keyframe,omitempty" jsonschema:"Ask the encoder for an immediate IDR frame"`
+	}
+	handle(srv, &mcp.Tool{
+		Name: "device_screen_video",
+		Description: "Stop or resume video encoding without restarting the session, or force a keyframe. " +
+			"Stopping clears the encoder's work when nobody is watching.",
+	}, func(ctx context.Context, args screenVideoArgs) (*mcp.CallToolResult, error) {
+		_, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("no active screen session for %s", rec.Serial)
+		}
+		if args.Enabled != nil {
+			sess.SetVideoEnabled(*args.Enabled)
+		}
+		if args.Keyframe {
+			sess.RequestKeyFrame()
+		}
+		return textResult(map[string]any{"device": rec.Serial, "video_enabled": sess.VideoEnabled(), "keyframe_requested": args.Keyframe})
+	})
+
 	// ── device_reboot ────────────────────────────────────────────────────
 	type rebootArgs struct {
 		Device string `json:"device" jsonschema:"Device serial"`

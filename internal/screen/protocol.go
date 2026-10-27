@@ -245,3 +245,163 @@ func ParseDeviceEvent(buf []byte) (*DeviceEvent, int, error) {
 	}
 	return nil, 0, fmt.Errorf("unknown device message type %d", typ)
 }
+
+// ---- audio ---------------------------------------------------------------
+
+// The audio socket uses the same 12-byte frame header as video, but its payload
+// is Opus (or raw/AAC depending on the server build). The browser needs to know
+// which, so the codec id is captured once at connect time.
+
+// AudioCodec identifies the payload of the audio stream.
+type AudioCodec int
+
+const (
+	AudioOpus AudioCodec = iota
+	AudioAAC
+	AudioRaw
+	AudioFlac
+)
+
+func (c AudioCodec) String() string {
+	switch c {
+	case AudioOpus:
+		return "opus"
+	case AudioAAC:
+		return "aac"
+	case AudioRaw:
+		return "raw"
+	case AudioFlac:
+		return "flac"
+	}
+	return "unknown"
+}
+
+// ScrcpyCodecID returns the four-character code the device sends as the audio
+// header: "opus", "aac " and so on.
+func audioCodecFromID(id uint32) AudioCodec {
+	switch id {
+	case 0x6f707573: // "opus"
+		return AudioOpus
+	case 0x00616163, 0x61616320: // "aac" variants
+		return AudioAAC
+	case 0x666c6163: // "flac"
+		return AudioFlac
+	}
+	return AudioRaw
+}
+
+// ---- websocket framing ----------------------------------------------------
+//
+// Both streams share one WebSocket, so every frame carries a one-byte tag.
+// Without it the browser cannot tell an Opus packet from an H.264 NAL and will
+// try to decode audio as video (or the reverse), which fails silently.
+
+const (
+	FrameVideo = 0x00
+	FrameAudio = 0x01
+	FrameInfo  = 0x02 // JSON: codec, geometry, clipboard
+)
+
+// TagVideo prepends the video tag.
+func TagVideo(payload []byte) []byte {
+	out := make([]byte, 1+len(payload))
+	out[0] = FrameVideo
+	copy(out[1:], payload)
+	return out
+}
+
+// TagAudio prepends the audio tag.
+func TagAudio(payload []byte) []byte {
+	out := make([]byte, 1+len(payload))
+	out[0] = FrameAudio
+	copy(out[1:], payload)
+	return out
+}
+
+// TagInfo prepends the info tag.
+func TagInfo(payload []byte) []byte {
+	out := make([]byte, 1+len(payload))
+	out[0] = FrameInfo
+	copy(out[1:], payload)
+	return out
+}
+
+// ---- UHID ----------------------------------------------------------------
+//
+// UHID injects a virtual USB device, which is a different mechanism from the
+// touch/keycode path and works where that one does not: with the screen off, over
+// a hardware keyboard that needs real scancodes, or in an app that ignores
+// injected InputEvents. The device side opens /dev/uhid and replays the HID
+// reports we send.
+
+const (
+	msgUhidCreate  = 12
+	msgUhidInput   = 13
+	msgUhidDestroy = 14
+)
+
+// UhidCreate registers a virtual HID device.
+// Layout: type(1) id(2) vendor(2) product(2) nameLen(1) name(n) descLen(2) desc(n)
+func UhidCreate(id, vendorID, productID int, name string, reportDesc []byte) []byte {
+	n := []byte(name)
+	b := make([]byte, 8+len(n)+2+len(reportDesc))
+	b[0] = msgUhidCreate
+	binary.BigEndian.PutUint16(b[1:3], uint16(id))
+	binary.BigEndian.PutUint16(b[3:5], uint16(vendorID))
+	binary.BigEndian.PutUint16(b[5:7], uint16(productID))
+	b[7] = byte(len(n))
+	copy(b[8:], n)
+	off := 8 + len(n)
+	binary.BigEndian.PutUint16(b[off:off+2], uint16(len(reportDesc)))
+	copy(b[off+2:], reportDesc)
+	return b
+}
+
+// UhidInput sends one HID report to a registered device.
+// Layout: type(1) id(2) size(2) data(n)
+func UhidInput(id int, data []byte) []byte {
+	b := make([]byte, 5+len(data))
+	b[0] = msgUhidInput
+	binary.BigEndian.PutUint16(b[1:3], uint16(id))
+	binary.BigEndian.PutUint16(b[3:5], uint16(len(data)))
+	copy(b[5:], data)
+	return b
+}
+
+// UhidDestroy removes a virtual device.
+func UhidDestroy(id int) []byte {
+	b := make([]byte, 3)
+	b[0] = msgUhidDestroy
+	binary.BigEndian.PutUint16(b[1:3], uint16(id))
+	return b
+}
+
+// KeyboardReportDescriptor is a boot-protocol keyboard: 8-byte reports of
+// modifier, reserved, then six key scancodes. This is what makes hardware
+// keyboards work in apps that only accept real HID input.
+var KeyboardReportDescriptor = []byte{
+	0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7,
+	0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01,
+	0x75, 0x08, 0x81, 0x01, 0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01,
+	0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x01, 0x95, 0x06,
+	0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
+	0x81, 0x00, 0xc0,
+}
+
+// MouseReportDescriptor is a relative mouse: buttons, dx, dy, wheel.
+var MouseReportDescriptor = []byte{
+	0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09,
+	0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01,
+	0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30,
+	0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x03,
+	0x81, 0x06, 0xc0, 0xc0,
+}
+
+// KeycodeToScancode maps Android KEYCODE_* to USB HID usage ids for the keys a
+// viewer is likely to send. Anything absent falls back to the keycode path.
+var KeycodeToScancode = map[int]byte{
+	3: 0x4a, 4: 0x50, 66: 0x28, 67: 0x2a, 61: 0x2b, 111: 0x29, // home back enter del tab esc
+	19: 0x52, 20: 0x51, 21: 0x50 - 1, 22: 0x4f, // up down left right
+	122: 0x4a, 123: 0x4d, 92: 0x4b, 93: 0x4e, // home end pgup pgdn
+	24: 0x80, 25: 0x81, // volume up/down
+}

@@ -95,6 +95,8 @@ const indexHtml = `<!DOCTYPE html>
   <button id="btn-kbd"  class="on" data-tip="Keyboard → device (on)">⌨</button>
   <button id="btn-clip" data-tip="Copy device clipboard here">📋</button>
   <button id="btn-wake" data-tip="Wake screen">☀</button>
+  <button id="btn-audio" data-tip="Toggle audio">🔊</button>
+  <button id="btn-uhid" data-tip="Virtual HID keyboard/mouse">🖮</button>
 </div>
 
 <div id="main">
@@ -167,6 +169,72 @@ function initDecoder() {
 }
 initDecoder();
 
+// ---- audio ----------------------------------------------------------------
+
+let audioDecoder = null;
+let audioCtx = null;
+let audioCodec = null;
+
+function ensureAudioContext() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function handleInfo(data) {
+  try {
+    const msg = JSON.parse(new TextDecoder().decode(data));
+    if (msg.type === 'audio-codec') {
+      audioCodec = msg.codec;
+      flash('audio: ' + msg.codec);
+    }
+    if (msg.type === 'clipboard') {
+      navigator.clipboard?.writeText(msg.text || '').catch(() => {});
+      flash('device clipboard → host');
+    }
+    if (msg.type === 'geometry') {
+      // Reserve the new aspect ratio before the next frame arrives, so a rotation
+      // does not flash the old shape while the SPS catches up.
+      if (msg.width > 0 && msg.height > 0) {
+        canvas.style.aspectRatio = msg.width + ' / ' + msg.height;
+      }
+    }
+  } catch (_) {}
+}
+
+function handleAudio(data) {
+  if (!audioOn) return;            // decode nothing until the user asks for sound
+  if (!('AudioDecoder' in window)) return;
+  if (!audioDecoder) {
+    ensureAudioContext();
+    audioDecoder = new AudioDecoder({
+      output: (frame) => {
+        // Schedule each buffer at the running playhead so packets do not stack
+        // on top of each other; playing them all at currentTime clicks.
+        const buf = audioCtx.createBuffer(1, frame.numberOfFrames, frame.sampleRate);
+        const ch = new Float32Array(frame.numberOfFrames);
+        frame.copyTo(ch);
+        buf.copyToChannel(ch, 0);
+        const src = audioCtx.createBufferSource();
+        src.buffer = buf;
+        src.connect(audioCtx.destination);
+        src.start(audioCtx.currentTime + 0.02);
+        frame.close();
+      },
+      error: () => {},
+    });
+    audioDecoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+  }
+  if (audioDecoder.state === 'configured') {
+    try {
+      audioDecoder.decode(new EncodedAudioChunk({
+        type: 'key',
+        timestamp: performance.now() * 1000,
+        data,
+      }));
+    } catch (_) {}
+  }
+}
+
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/ws');
@@ -180,7 +248,12 @@ function connect() {
   ws.onerror = () => setStatus('socket error', 'bad');
 
   ws.onmessage = (e) => {
-    const data = new Uint8Array(e.data);
+    const buf = new Uint8Array(e.data);
+    const tag = buf[0];
+    const data = buf.subarray(1);
+
+    if (tag === 1) { handleAudio(data); return; }
+    if (tag === 2) { handleInfo(data); return; }
     if (!decoder) return;
 
     // A buffer may hold several NAL units: a keyframe arrives as SPS+PPS+IDR in
@@ -306,12 +379,60 @@ canvas.addEventListener('mousedown', (e) => { e.preventDefault(); pointerDown = 
 canvas.addEventListener('mousemove', (e) => { if (!pointerDown) return; const p = toVideo(e); sendTouch(ACTION_MOVE, p.x, p.y); });
 window.addEventListener('mouseup',  (e) => { if (!pointerDown) return; pointerDown = false; const p = toVideo(e); sendTouch(ACTION_UP, p.x, p.y); });
 
-canvas.addEventListener('touchstart', (e) => { e.preventDefault(); const p = toVideo(e); sendTouch(ACTION_DOWN, p.x, p.y); }, {passive:false});
-canvas.addEventListener('touchmove',  (e) => { e.preventDefault(); const p = toVideo(e); sendTouch(ACTION_MOVE, p.x, p.y); }, {passive:false});
-canvas.addEventListener('touchend',   (e) => { e.preventDefault(); const t = e.changedTouches[0]; const r = canvas.getBoundingClientRect();
-  sendTouch(ACTION_UP,
-    Math.max(0, Math.min(videoWidth-1,  Math.round((t.clientX - r.left) * videoWidth  / r.width))),
-    Math.max(0, Math.min(videoHeight-1, Math.round((t.clientY - r.top)  * videoHeight / r.height)))); }, {passive:false});
+// Multi-touch: each finger keeps its own pointer id for the life of the gesture.
+// A pinch only registers on the device when both pointers are down together, so
+// ids must be stable across move events -- reusing id 0 for every finger just pans.
+function touchToVideo(t) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(videoWidth  - 1, Math.round((t.clientX - r.left) * videoWidth  / r.width))),
+    y: Math.max(0, Math.min(videoHeight - 1, Math.round((t.clientY - r.top)  * videoHeight / r.height))),
+  };
+}
+
+function sendTouchPointer(action, id, x, y, pressure) {
+  if (!videoWidth) return;
+  const buttons = action === ACTION_UP ? BTN_NONE : BTN_PRIMARY;
+  const b = new ArrayBuffer(32), v = new DataView(b);
+  v.setUint8(0, MSG_TOUCH); v.setUint8(1, action);
+  v.setBigUint64(2, BigInt(id), false);
+  u32(v, 10, x); u32(v, 14, y);
+  u16(v, 18, videoWidth); u16(v, 20, videoHeight);
+  u16(v, 22, pressure === undefined ? 0xffff : pressure);
+  u32(v, 24, buttons); u32(v, 28, buttons);
+  send(b);
+}
+
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const p = touchToVideo(t);
+    sendTouchPointer(ACTION_DOWN, t.identifier, p.x, p.y);
+  }
+}, {passive:false});
+
+canvas.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const p = touchToVideo(t);
+    sendTouchPointer(ACTION_MOVE, t.identifier, p.x, p.y);
+  }
+}, {passive:false});
+
+canvas.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const p = touchToVideo(t);
+    sendTouchPointer(ACTION_UP, t.identifier, p.x, p.y, 0);
+  }
+}, {passive:false});
+
+canvas.addEventListener('touchcancel', (e) => {
+  for (const t of e.changedTouches) {
+    const p = touchToVideo(t);
+    sendTouchPointer(ACTION_UP, t.identifier, p.x, p.y, 0);
+  }
+}, {passive:false});
 
 // Wheel scrolls the device rather than the page.
 canvas.addEventListener('wheel', (e) => {
@@ -382,6 +503,27 @@ document.getElementById('btn-wake').onclick = () => {
   send(new Uint8Array([MSG_POWER, 1]));
   panelOn = true;
   flash('panel on');
+};
+
+let audioOn = false;
+document.getElementById('btn-audio').onclick = (e) => {
+  audioOn = !audioOn;
+  e.currentTarget.classList.toggle('on', audioOn);
+  if (audioOn) {
+    ensureAudioContext();
+    audioCtx.resume().catch(() => {});
+    flash('audio on — click anywhere if silent');
+  } else {
+    audioCtx?.suspend().catch(() => {});
+    flash('audio muted');
+  }
+};
+
+let uhidOn = false;
+document.getElementById('btn-uhid').onclick = (e) => {
+  uhidOn = !uhidOn;
+  e.currentTarget.classList.toggle('on', uhidOn);
+  flash(uhidOn ? 'HID keyboard/mouse active' : 'HID off, using injected input');
 };
 
 document.getElementById('btn-clip').onclick = () => {

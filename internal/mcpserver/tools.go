@@ -76,6 +76,7 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		Device       string `json:"device" jsonschema:"Device serial"`
 		MaxSize      int    `json:"max_size,omitempty" jsonschema:"Longest screen side in pixels (default 1080)"`
 		VideoBitRate int    `json:"video_bit_rate,omitempty" jsonschema:"Encoder bitrate in bps (default 4000000)"`
+		ViewerPort   int    `json:"viewer_port,omitempty" jsonschema:"Fixed port for the web viewer. Omit for an OS-assigned port, which changes every restart."`
 	}
 	handle(srv, &mcp.Tool{
 		Name: "device_screen_start",
@@ -87,7 +88,7 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		if err != nil {
 			return errResult("resolve device: %v", err)
 		}
-		url, err := s.screen.Start(dev, rec.Serial, args.MaxSize, args.VideoBitRate)
+		url, err := s.screen.Start(dev, rec.Serial, args.MaxSize, args.VideoBitRate, args.ViewerPort)
 		if err != nil {
 			return errResult("start screen: %v", err)
 		}

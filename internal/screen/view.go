@@ -16,16 +16,44 @@ const indexHtml = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
-<title>adbox — %s</title>
+<title>adbox screen</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%%; }
   body { background: #0d0d0f; color: #e8e8ea; font-family: system-ui, -apple-system, sans-serif;
-         display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; }
+         display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
+
+  /* Left rail: a vertical strip of icon buttons beside the screen, the way a
+     remote control sits next to a TV. A bottom bar wastes vertical space, which
+     is exactly what a tall phone image needs. */
+  #rail { flex: 0 0 auto; width: 52px; display: flex; flex-direction: column; gap: 4px;
+          padding: 6px 5px; background: #17171a; border-right: 1px solid #26262b;
+          overflow-y: auto; overflow-x: hidden; scrollbar-width: none; }
+  #rail::-webkit-scrollbar { display: none; }
+
+  #rail button { width: 42px; height: 38px; display: flex; align-items: center; justify-content: center;
+                 background: #24242a; color: #d8d8dd; border: 1px solid #33333b; border-radius: 7px;
+                 font-size: 16px; line-height: 1; cursor: pointer; font-family: inherit;
+                 flex: 0 0 auto; position: relative; }
+  #rail button:hover { background: #2e2e36; border-color: #45454f; }
+  #rail button:active { background: #3a3a44; transform: scale(0.94); }
+  #rail button.on { background: #2a4a2e; border-color: #4caf50; color: #a5d6a7; }
+
+  /* Tooltip on hover, since the buttons are icon-only. */
+  #rail button::after { content: attr(data-tip); position: absolute; left: 46px; top: 50%%;
+                        transform: translateY(-50%%); background: #000; color: #eee;
+                        padding: 3px 7px; border-radius: 4px; font-size: 11px; white-space: nowrap;
+                        opacity: 0; pointer-events: none; transition: opacity .12s; z-index: 10;
+                        border: 1px solid #33333b; }
+  #rail button:hover::after { opacity: 1; }
+
+  #rail .sep { height: 1px; background: #2a2a30; margin: 3px 2px; flex: 0 0 auto; }
+
+  #main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 
   #header { flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
-            padding: 5px 10px; background: #17171a; border-bottom: 1px solid #26262b; font-size: 12px; }
-  #name { color: #9a9aa2; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            padding: 4px 10px; background: #17171a; border-bottom: 1px solid #26262b; font-size: 12px; }
+  #name { color: #9a9aa2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #status { margin-left: auto; color: #4caf50; font-variant-numeric: tabular-nums; white-space: nowrap; }
   #status.bad { color: #f44336; }
   #status.warn { color: #ff9800; }
@@ -33,55 +61,51 @@ const indexHtml = `<!DOCTYPE html>
   #viewport { flex: 1 1 auto; min-height: 0; display: flex; justify-content: center;
               align-items: center; overflow: hidden; padding: 4px; background: #000; }
 
-  /* Both max-width AND max-height, with auto width/height: the canvas keeps the
-     device aspect ratio and fits whichever dimension is tighter. max-width alone
-     lets a tall screen overflow the bottom in a landscape window. */
+  /* Both max-width AND max-height with auto width/height: the canvas keeps the
+     device aspect ratio and fits whichever dimension is tighter. */
   canvas { display: block; max-width: 100%%; max-height: 100%%; width: auto; height: auto;
-           background: #000; cursor: crosshair; box-shadow: 0 0 0 1px #26262b; }
+           background: #000; cursor: crosshair; }
 
-  #bar { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
-         padding: 6px 8px; background: #17171a; border-top: 1px solid #26262b; }
-  button { background: #24242a; color: #d8d8dd; border: 1px solid #33333b; border-radius: 6px;
-           padding: 7px 11px; font-size: 12px; cursor: pointer; font-family: inherit; }
-  button:hover { background: #2e2e36; border-color: #45454f; }
-  button:active { background: #3a3a44; transform: translateY(1px); }
-  button.on { background: #2a4a2e; border-color: #4caf50; color: #a5d6a7; }
-  #msg { color: #6a6a72; font-size: 11px; margin-left: auto; padding-right: 4px;
-         max-width: 45%%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #msg { position: fixed; bottom: 10px; left: 62px; background: #000c; color: #ddd;
+         padding: 5px 10px; border-radius: 5px; font-size: 11px; opacity: 0;
+         transition: opacity .2s; pointer-events: none; border: 1px solid #33333b; }
+  #msg.show { opacity: 1; }
 
-  /* Phone-shaped layouts: the bar scrolls horizontally instead of wrapping. */
-  @media (max-width: 560px) {
-    #bar { flex-wrap: nowrap; overflow-x: auto; }
-    button { flex: 0 0 auto; padding: 8px 10px; }
-    #msg { display: none; }
+  @media (max-width: 480px) {
+    #rail { width: 46px; padding: 5px 4px; }
+    #rail button { width: 38px; height: 34px; font-size: 15px; }
   }
 </style>
 </head>
 <body>
-<div id="header">
-  <span id="name">%s</span>
-  <span id="status" class="warn">connecting…</span>
+<div id="rail">
+  <button data-tip="Back"            data-key="4">◀</button>
+  <button data-tip="Home"            data-key="3">●</button>
+  <button data-tip="Recents"         data-key="187">■</button>
+  <div class="sep"></div>
+  <button data-tip="Volume up"       data-key="24">＋</button>
+  <button data-tip="Volume down"     data-key="25">－</button>
+  <button id="btn-power"  data-tip="Panel power (device keeps running)">⏻</button>
+  <div class="sep"></div>
+  <button id="btn-rotate"   data-tip="Rotate display">⟳</button>
+  <button id="btn-notif"    data-tip="Notification panel">☰</button>
+  <button id="btn-settings" data-tip="Quick settings">⚙</button>
+  <button id="btn-collapse" data-tip="Collapse panels">✕</button>
+  <div class="sep"></div>
+  <button id="btn-kbd"  class="on" data-tip="Keyboard → device (on)">⌨</button>
+  <button id="btn-clip" data-tip="Copy device clipboard here">📋</button>
+  <button id="btn-wake" data-tip="Wake screen">☀</button>
 </div>
 
-<div id="viewport"><canvas id="canvas"></canvas></div>
-
-<div id="bar">
-  <button data-key="4"   title="Back">◀ Back</button>
-  <button data-key="3"   title="Home">● Home</button>
-  <button data-key="187" title="Recents">■ Recents</button>
-  <button id="btn-power"  title="Toggle panel power">⏻ Power</button>
-  <button data-key="24" title="Volume up">Vol+</button>
-  <button data-key="25" title="Volume down">Vol−</button>
-  <button id="btn-rotate" title="Rotate">⟳ Rotate</button>
-  <button id="btn-notif"  title="Notification panel">☰</button>
-  <button id="btn-settings" title="Quick settings">⚙</button>
-  <button id="btn-collapse" title="Collapse panels">✕ Panels</button>
-  <button id="btn-kbd" title="Toggle keyboard input" class="on">⌨ Type</button>
-  <button id="btn-clip" title="Get device clipboard">📋 Get</button>
-  <span id="msg"></span>
+<div id="main">
+  <div id="header">
+    <span id="name">%s</span>
+    <span id="status" class="warn">connecting…</span>
+  </div>
+  <div id="viewport"><canvas id="canvas" tabindex="0"></canvas></div>
 </div>
 
-<textarea id="kbd" style="position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0"></textarea>
+<div id="msg"><textarea id="kbd" style="position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0"></textarea>
 
 <script>
 const canvas  = document.getElementById('canvas');
@@ -112,8 +136,9 @@ function setStatus(text, cls) {
 }
 function flash(text) {
   msgEl.textContent = text;
+  msgEl.classList.add('show');
   clearTimeout(flash._t);
-  flash._t = setTimeout(() => msgEl.textContent = '', 2500);
+  flash._t = setTimeout(() => msgEl.classList.remove('show'), 2200);
 }
 
 // ---- video ----------------------------------------------------------------
@@ -351,6 +376,12 @@ document.getElementById('btn-kbd').onclick = (e) => {
   keyboardMode = !keyboardMode;
   e.currentTarget.classList.toggle('on', keyboardMode);
   flash(keyboardMode ? 'keyboard → device' : 'keyboard captured by page');
+};
+
+document.getElementById('btn-wake').onclick = () => {
+  send(new Uint8Array([MSG_POWER, 1]));
+  panelOn = true;
+  flash('panel on');
 };
 
 document.getElementById('btn-clip').onclick = () => {

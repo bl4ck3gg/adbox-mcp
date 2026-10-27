@@ -26,8 +26,9 @@ type Session struct {
 	serial    string
 	scid      uint32
 	remoteJar string
-	maxSize   int
-	bitRate   int
+	maxSize    int
+	bitRate    int
+	viewerPort int
 
 	running   atomic.Bool
 	hub       *Hub
@@ -50,7 +51,7 @@ func init() {
 	scidCounter.Store(0x12340000)
 }
 
-func NewSession(dev *adb.Device, serial string, maxSize, bitRate int) *Session {
+func NewSession(dev *adb.Device, serial string, maxSize, bitRate, viewerPort int) *Session {
 	if maxSize <= 0 {
 		maxSize = 1080
 	}
@@ -63,9 +64,10 @@ func NewSession(dev *adb.Device, serial string, maxSize, bitRate int) *Session {
 		serial:    serial,
 		scid:      scid,
 		remoteJar: embedded.ScrcpyRemotePath,
-		maxSize:   maxSize,
-		bitRate:   bitRate,
-		hub:       newHub(),
+		maxSize:    maxSize,
+		bitRate:    bitRate,
+		viewerPort: viewerPort,
+		hub:        newHub(),
 	}
 }
 
@@ -151,7 +153,11 @@ func (s *Session) Start() (webUrl string, err error) {
 	if bindHost == "" {
 		bindHost = "127.0.0.1"
 	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(bindHost, "0"))
+	portSpec := "0"
+	if s.viewerPort > 0 {
+		portSpec = strconv.Itoa(s.viewerPort)
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(bindHost, portSpec))
 	if err != nil {
 		_ = videoConn.Close()
 		_ = controlConn.Close()

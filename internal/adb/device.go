@@ -316,6 +316,8 @@ func (c *Device) OpenInteractiveShell() (conn *wire.Conn, err error) {
 
 // RunInteractiveShellLinesFireAndClose 顺序写入各行后 CloseWrite 并断开，不 ReadUntilEof。
 // 用于 nohup/daemon bootstrap：不依赖设备 shell 执行 exit 后关连接（后台 job 会导致永不 EOF）。
+const drainTimeout = 3 * time.Second
+
 func (c *Device) RunInteractiveShellLinesFireAndClose(lines []string) error {
 	conn, err := c.OpenInteractiveShell()
 	if err != nil {
@@ -329,6 +331,23 @@ func (c *Device) RunInteractiveShellLinesFireAndClose(lines []string) error {
 	}
 	if err := conn.CloseWrite(); err != nil {
 		return wrapClientError(err, c, "RunInteractiveShellLinesFireAndClose(CloseWrite)")
+	}
+	// Drain until the device shell exits, instead of closing on top of it.
+	//
+	// Half-closing tells the shell "no more input"; closing the socket straight
+	// away tells adbd "the session is gone", and adbd reacts by killing the
+	// session's process group -- taking the daemon we just launched with it. The
+	// shell needs a moment to read EOF, exit normally, and let the child be
+	// reparented to init. Reading until EOF is that moment, and it costs the time
+	// the shell needs anyway.
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(drainTimeout):
 	}
 	if adbDebugEnabled() {
 		adbDebugf("[adb] RunInteractiveShellLinesFireAndClose device=%s: 已写入 %d 行并 CloseWrite，主机侧关闭会话", c.String(), len(lines))

@@ -12,6 +12,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"adbox-mcp/internal/adb"
+	"adbox-mcp/internal/embedded"
 	"adbox-mcp/internal/tasks"
 )
 
@@ -113,14 +114,185 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		}
 	})
 
-	// ── device_info ──────────────────────────────────────────────────────
+	// ── device_spawn ─────────────────────────────────────────────────────
+	//
+	// A detached process is the one thing a shell cannot do for you over adb.
+	// `cmd &` returns, but the child dies with the session: adbd tears down the
+	// whole process group when the shell's stdin closes or the connection drops
+	// by timeout, and no amount of nohup or setsid survives that -- the signal
+	// goes to the group, not the process.
+	//
+	// The way out is to never let the session be torn down. We open an
+	// interactive shell, write the command, and half-close our write side. The
+	// device shell reads EOF on stdin, exits normally, and the child -- nohup'd,
+	// so no SIGHUP -- is reparented to init instead of being killed with its
+	// parent's group.
+	//
+	// Measured on a Note 9: the same command that never survived `device_shell`
+	// is still listening on its port seconds later.
+	type spawnArgs struct {
+		Device  string `json:"device" jsonschema:"Device serial (optional: serial@endpoint to disambiguate)"`
+		Command string `json:"command" jsonschema:"Shell command line to launch in the background (quote and background it yourself, or pass the bare command)"`
+		Settle  int    `json:"settle_ms,omitempty" jsonschema:"Milliseconds to wait before checking, default 1200"`
+		Verify  string `json:"verify_command,omitempty" jsonschema:"Optional command run afterwards to prove the process is alive (e.g. pgrep -f mydaemon)"`
+	}
+	handle(srv, &mcp.Tool{
+		Name: "device_spawn",
+		Description: "Start a process on the device that outlives the shell session, then report whether it survived. " +
+			"Use this instead of device_shell for daemons, servers, and anything that must keep running. " +
+			"It half-closes the shell's stdin so the device sees a normal EOF rather than a torn-down session.",
+	}, func(ctx context.Context, args spawnArgs) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		// nohup must be the direct parent of the command, not of an intermediate
+		// sh -c: a wrapping shell exits immediately, leaving the real process in
+		// the session's process group where adbd can still reach it.
+		line := args.Command
+		if !strings.Contains(line, " &") {
+			line = "/system/bin/nohup " + line + " >/dev/null 2>&1 </dev/null &"
+		}
+		// The trailing sleep keeps the device shell alive long enough for the
+		// child to be reparented. Without it the shell reads EOF and exits in the
+		// same breath as the launch, and the teardown races the detach.
+		if err := dev.RunInteractiveShellLinesFireAndClose([]string{line, "sleep 1"}); err != nil {
+			return errResult("spawn: %v", err)
+		}
+
+		settle := 1200
+		if args.Settle > 0 {
+			settle = args.Settle
+		}
+		time.Sleep(time.Duration(settle) * time.Millisecond)
+
+		out := map[string]any{
+			"device":   rec.Serial,
+			"endpoint": rec.Endpoint,
+			"command":  line,
+			"spawned":  true,
+		}
+		if args.Verify != "" {
+			verifyOut, verr := dev.RunCommand(args.Verify)
+			out["verify_command"] = args.Verify
+			out["verify_output"] = strings.TrimSpace(verifyOut)
+			out["alive"] = verr == nil && strings.TrimSpace(verifyOut) != ""
+			if verr != nil {
+				out["verify_error"] = verr.Error()
+			}
+		}
+		return textResult(out)
+	})
+
+	// ── device_ui_start / device_ui_stop ─────────────────────────────────
+	type uiStartArgs struct {
+		Device  string `json:"device" jsonschema:"Device serial (optional: serial@endpoint to disambiguate)"`
+		Port    int    `json:"port,omitempty" jsonschema:"Local port to expose the UI server on (default 18080)"`
+		Restart bool   `json:"restart,omitempty" jsonschema:"Kill any running instance first"`
+		Force   bool   `json:"force_push,omitempty" jsonschema:"Push the embedded APK even if the device copy is the right size"`
+	}
+	handle(srv, &mcp.Tool{
+		Name: "device_ui_start",
+		Description: "Install and launch the embedded uia2-mcp server on the device, then expose it on a local port. " +
+			"One call replaces push + spawn + forward. Returns the URL to open as an MCP endpoint.",
+	}, func(ctx context.Context, args uiStartArgs) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		port := args.Port
+		if port <= 0 {
+			port = 18080
+		}
+
+		if args.Restart {
+			if _, err := dev.RunCommand("pkill -f " + embedded.Uia2MainClass); err != nil {
+				// pkill exits non-zero when nothing matched; that is the good path.
+				_ = err
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+
+		// Push only when the on-device copy differs in size. A full read would cost
+		// a transfer just to compare bytes, and version drift is what actually bites.
+		needPush := args.Force
+		if !needPush {
+			out, _ := dev.RunCommand("stat -c %s " + embedded.Uia2RemotePath + " 2>/dev/null")
+			needPush = strings.TrimSpace(out) != strconv.Itoa(len(embedded.Uia2Apk))
+		}
+		if needPush {
+			w, werr := dev.OpenWrite(embedded.Uia2RemotePath, 0644, time.Now())
+			if werr != nil {
+				return errResult("open device writer: %v", werr)
+			}
+			if _, werr = w.Write(embedded.Uia2Apk); werr != nil {
+				w.Close()
+				return errResult("push embedded apk: %v", werr)
+			}
+			if werr = w.Close(); werr != nil {
+				return errResult("close device writer: %v", werr)
+			}
+		}
+
+		// Same launch shape as device_spawn: nohup must parent the process directly,
+		// and the trailing sleep keeps the device shell alive while it detaches.
+		launch := "/system/bin/nohup env CLASSPATH=" + embedded.Uia2RemotePath +
+			" app_process / " + embedded.Uia2MainClass + " --port " + strconv.Itoa(port) +
+			" >/dev/null 2>&1 </dev/null &"
+		if err := dev.RunInteractiveShellLinesFireAndClose([]string{launch, "sleep 1"}); err != nil {
+			return errResult("spawn uia2-mcp: %v", err)
+		}
+
+		time.Sleep(2500 * time.Millisecond) // UiAutomation connect is the slow part
+
+		locSpec, _ := parseForwardSpec(fmt.Sprintf("tcp:%d", port))
+		remSpec, _ := parseForwardSpec(fmt.Sprintf("tcp:%d", port))
+		if ferr := dev.Forward(locSpec, remSpec); ferr != nil {
+			return errResult("forward port %d: %v", port, ferr)
+		}
+
+		alive, _ := dev.RunCommand("pgrep -f " + embedded.Uia2MainClass)
+		log, _ := dev.RunCommand("tail -n 3 /data/local/tmp/uia2-mcp.log 2>/dev/null")
+
+		return textResult(map[string]any{
+			"device":   rec.Serial,
+			"endpoint": rec.Endpoint,
+			"pushed":   needPush,
+			"version":  embedded.Uia2Version,
+			"alive":    strings.TrimSpace(alive) != "",
+			"pid":      strings.TrimSpace(alive),
+			"mcp_url":  fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+			"log_tail": strings.TrimSpace(log),
+		})
+	})
+
+	handle(srv, &mcp.Tool{
+		Name:        "device_ui_stop",
+		Description: "Stop the embedded uia2-mcp server and remove its port forward.",
+	}, func(ctx context.Context, args struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+	}) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		out, _ := dev.RunCommand("pkill -f " + embedded.Uia2MainClass + "; echo stopped")
+		return textResult(map[string]any{
+			"device": rec.Serial,
+			"output": strings.TrimSpace(out),
+		})
+	})
+
+	// ── device_info ────────────────────────────────────────────────��─────
 	type devArgs struct {
 		Device string `json:"device" jsonschema:"Device serial (optional: serial@endpoint to disambiguate)"`
 	}
 	handle(srv, &mcp.Tool{
 		Name:        "device_info",
 		Description: "Read device properties: model, brand, Android version, SDK level, screen size, and battery.",
-	}, func(ctx context.Context, args devArgs) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+	}) (*mcp.CallToolResult, error) {
 		dev, rec, err := s.mgr.ResolveDevice(args.Device)
 		if err != nil {
 			return errResult("resolve device: %v", err)
@@ -414,4 +586,9 @@ func parseForwardSpec(spec string) (adb.ForwardSpec, error) {
 	default:
 		return adb.ForwardSpec{}, fmt.Errorf("unsupported protocol %q", parts[0])
 	}
+}
+
+// shellQuote wraps a command in single quotes for safe embedding in a shell line.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }

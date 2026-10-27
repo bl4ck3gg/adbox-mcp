@@ -200,17 +200,26 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		if err != nil {
 			return errResult("resolve device: %v", err)
 		}
-		port := args.Port
-		if port <= 0 {
-			port = 18080
-		}
+		requestedPort := args.Port
 
-		if args.Restart {
-			if _, err := dev.RunCommand("pkill -f " + embedded.AgentMainClass); err != nil {
-				// pkill exits non-zero when nothing matched; that is the good path.
-				_ = err
-			}
-			time.Sleep(300 * time.Millisecond)
+		// Always clear stale agents, not only on restart.
+		//
+		// UiAutomation is a single global registration: if any earlier instance
+		// still holds it, the new process dies with "UiAutomationService already
+		// registered!" and never reaches its ready beacon. That is not a rare
+		// edge case -- it is what happens every time a spawn is cut short, the
+		// device reboots oddly, or an agent was left behind by a previous name.
+		//
+		// Both class names are matched because the agent was renamed from
+		// bl4ck3gg.uia2mcp.Main to bl4ck3gg.adbox.agent.Main, and a device
+		// carrying the old build is exactly the device most likely to be holding
+		// the registration.
+		killCmd := "pkill -f " + embedded.AgentMainClass +
+			"; pkill -f bl4ck3gg.uia2mcp.Main" +
+			"; sleep 1"
+		if _, err := dev.RunCommand(killCmd); err != nil {
+			// pkill exits non-zero when nothing matched; that is the good path.
+			_ = err
 		}
 
 		// Push only when the on-device copy differs in size. A full read would cost
@@ -237,32 +246,63 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		// Same launch shape as device_spawn: nohup must parent the process directly,
 		// and the trailing sleep keeps the device shell alive while it detaches.
 		launch := "/system/bin/nohup env CLASSPATH=" + embedded.AgentRemotePath +
-			" app_process / " + embedded.AgentMainClass + " --port " + strconv.Itoa(port) +
+			" app_process / " + embedded.AgentMainClass + " --port " + strconv.Itoa(requestedPort) +
 			" >/dev/null 2>&1 </dev/null &"
 		if err := dev.RunInteractiveShellLinesFireAndClose([]string{launch, "sleep 1"}); err != nil {
 			return errResult("spawn adbox-agent: %v", err)
 		}
 
-		time.Sleep(2500 * time.Millisecond) // UiAutomation connect is the slow part
-
-		locSpec, _ := parseForwardSpec(fmt.Sprintf("tcp:%d", port))
-		remSpec, _ := parseForwardSpec(fmt.Sprintf("tcp:%d", port))
-		if ferr := dev.Forward(locSpec, remSpec); ferr != nil {
-			return errResult("forward port %d: %v", port, ferr)
+		// Poll the ready beacon instead of sleeping a fixed duration.
+		var actualRemotePort int
+		var agentPid string
+		deadline := time.Now().Add(6 * time.Second)
+		for time.Now().Before(deadline) {
+			out, _ := dev.RunCommand("cat /data/local/tmp/adbox-agent.ready 2>/dev/null")
+			out = strings.TrimSpace(out)
+			if out != "" {
+				for _, line := range strings.Split(out, "\n") {
+					parts := strings.SplitN(strings.TrimSpace(line), "=", 2)
+					if len(parts) == 2 {
+						switch parts[0] {
+						case "port":
+							actualRemotePort, _ = strconv.Atoi(parts[1])
+						case "pid":
+							agentPid = parts[1]
+						}
+					}
+				}
+				if actualRemotePort > 0 {
+					break
+				}
+			}
+			time.Sleep(150 * time.Millisecond)
 		}
 
-		alive, _ := dev.RunCommand("pgrep -f " + embedded.AgentMainClass)
+		if actualRemotePort <= 0 {
+			log, _ := dev.RunCommand("tail -n 6 /data/local/tmp/adbox-agent.log 2>/dev/null")
+			return errResult("agent failed to report ready within 6s; log: %s", strings.TrimSpace(log))
+		}
+
+		// Dynamic forward: tcp:0 on host lets the adb server choose an ephemeral port.
+		remSpec := adb.ForwardSpec{Protocol: adb.FProtocolTcp, PortOrName: strconv.Itoa(actualRemotePort)}
+		localPort, ferr := dev.ForwardToFreePort(remSpec)
+		if ferr != nil {
+			return errResult("forward to remote port %d: %v", actualRemotePort, ferr)
+		}
+
 		log, _ := dev.RunCommand("tail -n 3 /data/local/tmp/adbox-agent.log 2>/dev/null")
 
 		return textResult(map[string]any{
-			"device":   rec.Serial,
-			"endpoint": rec.Endpoint,
-			"pushed":   needPush,
-			"version":  embedded.AgentVersion,
-			"alive":    strings.TrimSpace(alive) != "",
-			"pid":      strings.TrimSpace(alive),
-			"mcp_url":  fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
-			"log_tail": strings.TrimSpace(log),
+			"device":       rec.Serial,
+			"endpoint":     rec.Endpoint,
+			"pushed":       needPush,
+			"version":      embedded.AgentVersion,
+			"alive":        true,
+			"pid":          agentPid,
+			"remote_port":  actualRemotePort,
+			"local_port":   localPort,
+			"mcp_url":      fmt.Sprintf("http://127.0.0.1:%d/mcp", localPort),
+			"log_tail":     strings.TrimSpace(log),
 		})
 	})
 

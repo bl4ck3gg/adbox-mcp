@@ -146,6 +146,12 @@ public class McpCore {
                 content.put("text", new JSONObject().put("ok", doInput(args)).toString());
                 break;
             }
+                        case "tether_start": {
+                return TetherController.start(args);
+            }
+            case "tether_stop": {
+                return TetherController.stop();
+            }
             case "device_eval": {
                 return Reflect.eval(null, args);
             }

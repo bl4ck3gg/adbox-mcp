@@ -115,7 +115,20 @@ public class Main {
 
             McpHttpServer server = new McpHttpServer(port, core);
             server.start();
-            step("listening on 127.0.0.1:" + port + "  (POST /mcp)");
+            int actual = server.getPort();
+            step("listening on 127.0.0.1:" + actual + "  (POST /mcp)");
+
+            // Write the ready beacon. The host does NOT read stdout (which is
+            // prone to logging noise and buffering issues) -- it reads this file
+            // once, gets the actual port, and deletes it.
+            try {
+                java.io.File readyFile = new java.io.File("/data/local/tmp/adbox-agent.ready");
+                java.io.FileWriter fw = new java.io.FileWriter(readyFile);
+                fw.write("port=" + actual + "\npid=" + android.os.Process.myPid() + "\n");
+                fw.close();
+            } catch (Throwable t) {
+                step("warning: could not write ready file: " + t);
+            }
             while (server.isAlive()) {
                 Thread.sleep(1000);
             }

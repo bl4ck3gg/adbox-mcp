@@ -29,6 +29,7 @@ public class McpHttpServer {
 
     private final McpCore core;
     private final int port;
+    // actualPort is set after successful bind
     private ServerSocket server;
 
     public McpHttpServer(int port, McpCore core) {
@@ -36,13 +37,39 @@ public class McpHttpServer {
         this.core = core;
     }
 
+    private int actualPort;
+
+    public int getPort() {
+        return actualPort;
+    }
+
     public void start() throws IOException {
         server = new ServerSocket();
-        // Bind to loopback: reachable through adb forward and nothing else. There is
-        // no authentication here, so the bind address is the access control.
         server.setReuseAddress(true);
-        server.bind(new InetSocketAddress("127.0.0.1", port));
-        Thread acceptor = new Thread(this::acceptLoop, "uia2-mcp-http");
+
+        int target = port;
+        int maxAttempts = (target <= 0) ? 1 : 50;
+        IOException lastErr = null;
+
+        for (int i = 0; i < maxAttempts; i++) {
+            try {
+                int tryPort = (target <= 0) ? 0 : (target + i);
+                server.bind(new InetSocketAddress("127.0.0.1", tryPort));
+                this.actualPort = server.getLocalPort();
+                lastErr = null;
+                break;
+            } catch (IOException e) {
+                lastErr = e;
+                server.close();
+                server = new ServerSocket();
+                server.setReuseAddress(true);
+            }
+        }
+        if (lastErr != null) {
+            throw new IOException("failed to bind port starting from " + target + " after " + maxAttempts + " attempts", lastErr);
+        }
+
+        Thread acceptor = new Thread(this::acceptLoop, "adbox-agent-http");
         acceptor.setDaemon(true);
         acceptor.start();
     }

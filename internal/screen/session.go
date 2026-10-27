@@ -33,6 +33,7 @@ type Session struct {
 	viewerPort     int
 	enableVideoSrc bool
 	enableAudioSrc bool
+	onEnded        func(reason string)
 	uhidOn      atomic.Bool
 	audioActive atomic.Bool
 	audioConn   atomic.Pointer[net.Conn]
@@ -395,6 +396,11 @@ func (s *Session) handleWS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Session) readVideoLoop(conn net.Conn) {
 	defer conn.Close()
+	// Video EOF means the on-device server stopped encoding: the app rotated
+	// into a state it could not capture, the process was killed, or the device
+	// went away. Either way this session is dead and must be reported, or every
+	// later call fails on a socket nobody is behind.
+	defer func() { s.notifyEnded("video stream ended") }()
 
 	// 1. Consume device name (64B) or direct 12B codec header
 	first4 := make([]byte, 4)
@@ -499,6 +505,10 @@ type geometry struct {
 // up and stalls the control channel -- so this runs for the session's whole life
 // even when no client asks for anything.
 func (s *Session) readControlLoop(conn net.Conn) {
+	// The control channel ending is equally fatal: it is the only path to the
+	// device, so input would silently stop working while the page kept showing
+	// a frozen frame.
+	defer func() { s.notifyEnded("control stream ended") }()
 	buf := make([]byte, 0, 4096)
 	chunk := make([]byte, 2048)
 	for s.running.Load() {
@@ -927,3 +937,20 @@ func (s *Session) Width() int { return int(s.hub.width.Load()) }
 
 // Height reports the decoded video height in pixels, or 0 if unknown yet.
 func (s *Session) Height() int { return int(s.hub.height.Load()) }
+
+// SetOnEnded registers a callback for when the session terminates from the
+// device side (scrcpy crashed, USB yanked, screen encoder aborted).
+func (s *Session) SetOnEnded(cb func(reason string)) { s.onEnded = cb }
+
+func (s *Session) notifyEnded(reason string) {
+	if s.running.CompareAndSwap(true, false) {
+		slog.Warn("screen session ended by device", "device", s.serial, "reason", reason)
+		if s.onEnded != nil {
+			go s.onEnded(reason)
+		}
+		s.hub.Stop()
+	}
+}
+
+// Running reports whether the session is still alive on the device side.
+func (s *Session) Running() bool { return s.running.Load() }

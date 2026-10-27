@@ -12,6 +12,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"adbox-mcp/internal/adb"
+	"adbox-mcp/internal/tasks"
 )
 
 type emptyArgs struct{}
@@ -286,13 +287,17 @@ func (s *Server) registerTools(srv *mcp.Server) {
 
 	// ── device_push / device_pull ────────────────────────────────────────
 	type pushArgs struct {
-		Device     string `json:"device" jsonschema:"Device serial"`
-		LocalPath  string `json:"local_path" jsonschema:"Absolute path of local file"`
-		RemotePath string `json:"remote_path" jsonschema:"Absolute path on device filesystem"`
+		Device     string   `json:"device" jsonschema:"Device serial"`
+		LocalPath  string   `json:"local_path" jsonschema:"Absolute path of the local file"`
+		RemotePath string   `json:"remote_path" jsonschema:"Absolute path on the device"`
+		WaitSec    *float64 `json:"wait_seconds,omitempty" jsonschema:"How long to wait for completion before returning a task id (default 10, 0 = return immediately)"`
 	}
 	handle(srv, &mcp.Tool{
-		Name:        "device_push",
-		Description: "Push a local file to the device using the native adb sync protocol.",
+		Name: "device_push",
+		Description: "Push a local file to the device over the native adb sync protocol. " +
+			"Returns the finished result when the transfer completes within wait_seconds, " +
+			"otherwise returns a task id to poll with task_status. Large files are expected: " +
+			"the transfer keeps running whether or not the caller waits.",
 	}, func(ctx context.Context, args pushArgs) (*mcp.CallToolResult, error) {
 		dev, _, err := s.mgr.ResolveDevice(args.Device)
 		if err != nil {
@@ -302,21 +307,93 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		if err != nil {
 			return errResult("open local file: %v", err)
 		}
-		defer f.Close()
 		stat, err := f.Stat()
 		if err != nil {
+			f.Close()
 			return errResult("stat local file: %v", err)
 		}
-		w, err := dev.OpenWrite(args.RemotePath, 0644, stat.ModTime())
-		if err != nil {
-			return errResult("open device sync writer: %v", err)
+		size := stat.Size()
+		modTime := stat.ModTime()
+
+		task := s.tasks.Start("push", args.Device, func(h *tasks.Handle) error {
+			defer f.Close()
+			h.SetTotal(size)
+			w, err := dev.OpenWrite(args.RemotePath, 0644, modTime)
+			if err != nil {
+				return fmt.Errorf("open device writer: %w", err)
+			}
+			defer w.Close()
+			n, err := io.Copy(w, io.TeeReader(f, tasks.ProgressWriter{H: h}))
+			if err != nil {
+				return fmt.Errorf("transfer: %w", err)
+			}
+			if n != size {
+				return fmt.Errorf("short write: sent %d of %d bytes", n, size)
+			}
+			return nil
+		})
+
+		// wait_seconds is a float so that "0" can mean "do not wait at all", while an
+		// absent field takes the default. A plain int would make the zero value
+		// ambiguous, and defaulting an explicit 0 to 10s would hide the caller's
+		// intent to fire and forget.
+		wait := 10 * time.Second
+		if args.WaitSec != nil {
+			wait = time.Duration(*args.WaitSec * float64(time.Second))
 		}
-		defer w.Close()
-		n, err := io.Copy(w, f)
-		if err != nil {
-			return errResult("push stream broke: %v", err)
+		if wait > 0 {
+			if final, done := s.tasks.Wait(task.ID, wait); done {
+				if final.State == tasks.Failed {
+					return errResult("push failed: %s", final.Error)
+				}
+				return textResult(map[string]any{
+					"ok":            true,
+					"bytes_written": final.Moved,
+					"remote_path":   args.RemotePath,
+					"state":         final.State,
+				})
+			}
 		}
-		return textResult(map[string]any{"ok": true, "bytes_written": n})
+		return textResult(map[string]any{
+			"ok":          true,
+			"state":       task.State,
+			"task_id":     task.ID,
+			"total_bytes": size,
+			"moved_bytes": task.Moved,
+			"hint":        "still running; poll task_status with this id",
+		})
+	})
+
+	// ── task_status / task_list / task_cancel ────────────────────────────
+	type taskStatusArgs struct {
+		TaskID string `json:"task_id" jsonschema:"Task id returned by an async tool"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "task_status",
+		Description: "Read a background task: state (running/done/failed/cancelled), moved vs total bytes, and any error.",
+	}, func(ctx context.Context, args taskStatusArgs) (*mcp.CallToolResult, error) {
+		t, ok := s.tasks.Get(args.TaskID)
+		if !ok {
+			return errResult("unknown task %q", args.TaskID)
+		}
+		return textResult(&t)
+	})
+
+	handle(srv, &mcp.Tool{
+		Name:        "task_list",
+		Description: "List every background task this process has run, oldest first.",
+	}, func(ctx context.Context, _ emptyArgs) (*mcp.CallToolResult, error) {
+		return textResult(s.tasks.List())
+	})
+
+	type taskCancelArgs struct {
+		TaskID string `json:"task_id" jsonschema:"Task id to stop"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "task_cancel",
+		Description: "Stop a running background task at its next message boundary.",
+	}, func(ctx context.Context, args taskCancelArgs) (*mcp.CallToolResult, error) {
+		return textResult(map[string]any{"ok": s.tasks.Cancel(args.TaskID)})
 	})
 }
 

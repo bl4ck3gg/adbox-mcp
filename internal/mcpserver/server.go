@@ -26,14 +26,16 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"adbox-mcp/internal/endpoint"
+	"adbox-mcp/internal/tasks"
 )
 
 type Server struct {
-	mgr *endpoint.Manager
+	mgr   *endpoint.Manager
+	tasks *tasks.Registry
 }
 
 func New(mgr *endpoint.Manager) *Server {
-	return &Server{mgr: mgr}
+	return &Server{mgr: mgr, tasks: tasks.NewRegistry()}
 }
 
 // Run serves MCP over stdio until the context is cancelled.

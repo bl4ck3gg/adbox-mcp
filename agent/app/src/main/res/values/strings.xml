@@ -1,0 +1,8 @@
+<resources>
+    <!-- 应用名（桌面/通知栏显示）；VPN 名（系统 VPN 列表里显示） -->
+    <string name="app_name" translatable="false">Tether</string>
+    <string name="vpn_session_name" translatable="false">Tether VPN</string>
+    <string name="relay_connected">Reverse tethering enabled</string>
+    <string name="relay_disconnected">Disconnected from the relay server</string>
+    <string name="stop_vpn">Stop VPN</string>
+</resources>

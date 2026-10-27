@@ -1,0 +1,9 @@
+# Build output. The app that matters is internal/embedded/adbox-agent.apk, which
+# is produced from these sources and committed deliberately -- the binary is the
+# deliverable, so it is tracked; the intermediates that produce it are not.
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/

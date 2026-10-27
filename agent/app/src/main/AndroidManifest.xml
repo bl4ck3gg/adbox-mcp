@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- The installed entry point needs these to run a VpnService. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        tools:ignore="GoogleAppIndexingWarning">
+
+        <!--
+            Entry point A: installed normally. The system binds this service by
+            package name and a human grants the VPN. Nothing else can bind it.
+        -->
+        <activity
+            android:name="com.genymobile.gnirehtet.GnirehtetActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Transparent">
+            <intent-filter>
+                <action android:name="com.genymobile.gnirehtet.START" />
+                <action android:name="com.genymobile.gnirehtet.STOP" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name="com.genymobile.gnirehtet.GnirehtetService"
+            android:enabled="true"
+            android:exported="true"
+            android:foregroundServiceType="connectedDevice"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
+        <!--
+            Entry points B and C run through app_process and never appear here:
+            bl4ck3gg.adbox.agent.Main serves the UI automation MCP, and
+            bl4ck3gg.adbox.agent.Main bridge joins the VPN's packet stream to a TCP
+            port. Both are ordinary Java programs with no app identity, which is
+            exactly why they need no manifest and no permission grant.
+        -->
+    </application>
+
+</manifest>

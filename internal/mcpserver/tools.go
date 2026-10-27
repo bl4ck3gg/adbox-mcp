@@ -193,7 +193,7 @@ func (s *Server) registerTools(srv *mcp.Server) {
 	}
 	handle(srv, &mcp.Tool{
 		Name: "device_ui_start",
-		Description: "Install and launch the embedded uia2-mcp server on the device, then expose it on a local port. " +
+		Description: "Install and launch the embedded adbox-agent server on the device, then expose it on a local port. " +
 			"One call replaces push + spawn + forward. Returns the URL to open as an MCP endpoint.",
 	}, func(ctx context.Context, args uiStartArgs) (*mcp.CallToolResult, error) {
 		dev, rec, err := s.mgr.ResolveDevice(args.Device)
@@ -206,7 +206,7 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		}
 
 		if args.Restart {
-			if _, err := dev.RunCommand("pkill -f " + embedded.Uia2MainClass); err != nil {
+			if _, err := dev.RunCommand("pkill -f " + embedded.AgentMainClass); err != nil {
 				// pkill exits non-zero when nothing matched; that is the good path.
 				_ = err
 			}
@@ -217,15 +217,15 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		// a transfer just to compare bytes, and version drift is what actually bites.
 		needPush := args.Force
 		if !needPush {
-			out, _ := dev.RunCommand("stat -c %s " + embedded.Uia2RemotePath + " 2>/dev/null")
-			needPush = strings.TrimSpace(out) != strconv.Itoa(len(embedded.Uia2Apk))
+			out, _ := dev.RunCommand("stat -c %s " + embedded.AgentRemotePath + " 2>/dev/null")
+			needPush = strings.TrimSpace(out) != strconv.Itoa(len(embedded.AgentApk))
 		}
 		if needPush {
-			w, werr := dev.OpenWrite(embedded.Uia2RemotePath, 0644, time.Now())
+			w, werr := dev.OpenWrite(embedded.AgentRemotePath, 0644, time.Now())
 			if werr != nil {
 				return errResult("open device writer: %v", werr)
 			}
-			if _, werr = w.Write(embedded.Uia2Apk); werr != nil {
+			if _, werr = w.Write(embedded.AgentApk); werr != nil {
 				w.Close()
 				return errResult("push embedded apk: %v", werr)
 			}
@@ -236,11 +236,11 @@ func (s *Server) registerTools(srv *mcp.Server) {
 
 		// Same launch shape as device_spawn: nohup must parent the process directly,
 		// and the trailing sleep keeps the device shell alive while it detaches.
-		launch := "/system/bin/nohup env CLASSPATH=" + embedded.Uia2RemotePath +
-			" app_process / " + embedded.Uia2MainClass + " --port " + strconv.Itoa(port) +
+		launch := "/system/bin/nohup env CLASSPATH=" + embedded.AgentRemotePath +
+			" app_process / " + embedded.AgentMainClass + " --port " + strconv.Itoa(port) +
 			" >/dev/null 2>&1 </dev/null &"
 		if err := dev.RunInteractiveShellLinesFireAndClose([]string{launch, "sleep 1"}); err != nil {
-			return errResult("spawn uia2-mcp: %v", err)
+			return errResult("spawn adbox-agent: %v", err)
 		}
 
 		time.Sleep(2500 * time.Millisecond) // UiAutomation connect is the slow part
@@ -251,14 +251,14 @@ func (s *Server) registerTools(srv *mcp.Server) {
 			return errResult("forward port %d: %v", port, ferr)
 		}
 
-		alive, _ := dev.RunCommand("pgrep -f " + embedded.Uia2MainClass)
-		log, _ := dev.RunCommand("tail -n 3 /data/local/tmp/uia2-mcp.log 2>/dev/null")
+		alive, _ := dev.RunCommand("pgrep -f " + embedded.AgentMainClass)
+		log, _ := dev.RunCommand("tail -n 3 /data/local/tmp/adbox-agent.log 2>/dev/null")
 
 		return textResult(map[string]any{
 			"device":   rec.Serial,
 			"endpoint": rec.Endpoint,
 			"pushed":   needPush,
-			"version":  embedded.Uia2Version,
+			"version":  embedded.AgentVersion,
 			"alive":    strings.TrimSpace(alive) != "",
 			"pid":      strings.TrimSpace(alive),
 			"mcp_url":  fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
@@ -268,7 +268,7 @@ func (s *Server) registerTools(srv *mcp.Server) {
 
 	handle(srv, &mcp.Tool{
 		Name:        "device_ui_stop",
-		Description: "Stop the embedded uia2-mcp server and remove its port forward.",
+		Description: "Stop the embedded adbox-agent server and remove its port forward.",
 	}, func(ctx context.Context, args struct {
 		Device string `json:"device" jsonschema:"Device serial"`
 	}) (*mcp.CallToolResult, error) {
@@ -276,7 +276,7 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		if err != nil {
 			return errResult("resolve device: %v", err)
 		}
-		out, _ := dev.RunCommand("pkill -f " + embedded.Uia2MainClass + "; echo stopped")
+		out, _ := dev.RunCommand("pkill -f " + embedded.AgentMainClass + "; echo stopped")
 		return textResult(map[string]any{
 			"device": rec.Serial,
 			"output": strings.TrimSpace(out),

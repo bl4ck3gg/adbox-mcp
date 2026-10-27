@@ -1,0 +1,71 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace "bl4ck3gg.adbox.agent"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "bl4ck3gg.adbox.agent"
+        minSdk 21
+        targetSdk 35
+        versionCode 1
+        versionName "0.1.0"
+        archivesBaseName = "adbox-agent"
+    }
+
+    signingConfigs {
+        // A self-signed debug key: this APK is installed by hand over adb for
+        // app_process and, when asked, as the VPN service. It never goes to a
+        // store, so the debug keystore is the right amount of ceremony.
+        debugKey {
+            storeFile file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debugKey
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            output.outputFileName = "uia2-mcp.apk"
+        }
+    }
+}
+
+// No third-party runtime dependencies on purpose. The two this project used to
+// carry -- androidx.test.uiautomator for one Configurator call, and NanoHTTPD for
+// one request shape -- contributed most of the APK's bytes and none of its
+// behaviour once UiDevice was dropped.
+dependencies {}
+
+
+// The artifact name is part of the contract: adbox looks for exactly this file
+// when it embeds the agent, and the remote path it pushes to carries the same
+// name so a running device shows what it is running.
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.outputs.each { output ->
+            output.outputFileName.set("adbox-agent.apk")
+        }
+    }
+}

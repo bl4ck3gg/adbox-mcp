@@ -27,6 +27,7 @@ import (
 
 	"adbox-mcp/internal/endpoint"
 	"adbox-mcp/internal/tasks"
+	"adbox-mcp/internal/screen"
 	"adbox-mcp/internal/tether"
 )
 
@@ -34,6 +35,7 @@ type Server struct {
 	mgr    *endpoint.Manager
 	tasks  *tasks.Registry
 	tether *tether.Manager
+	screen *screen.Manager
 }
 
 func New(mgr *endpoint.Manager) *Server {
@@ -41,6 +43,7 @@ func New(mgr *endpoint.Manager) *Server {
 		mgr:    mgr,
 		tasks:  tasks.NewRegistry(),
 		tether: tether.NewManager(),
+		screen: screen.NewManager(),
 	}
 }
 

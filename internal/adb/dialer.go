@@ -50,3 +50,8 @@ func (tcpDialer) Dial(address string) (*wire.Conn, error) {
 		RawTCPConn: tcpRaw,
 	}, nil
 }
+
+// RawDialer can produce a plain net.Conn across the same transport.
+type RawDialer interface {
+	DialRaw(network, address string) (net.Conn, error)
+}

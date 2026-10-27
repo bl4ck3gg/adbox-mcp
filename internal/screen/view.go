@@ -1,0 +1,163 @@
+package screen
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func (s *Session) handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, indexHtml, s.serial)
+}
+
+const indexHtml = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>adbox screen — %s</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #111; color: #eee; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; height: 100vh; overflow: hidden; }
+  #header { width: 100%%; padding: 6px 12px; background: #1a1a1a; display: flex; justify-content: space-between; font-size: 13px; color: #888; border-bottom: 1px solid #2a2a2a; }
+  #status { color: #4caf50; }
+  #viewport { flex: 1; display: flex; justify-content: center; align-items: center; width: 100%%; position: relative; }
+  canvas { max-width: 100%%; max-height: 100%%; object-fit: contain; cursor: pointer; box-shadow: 0 4px 20px rgba(0,0,0,0.8); background: #000; }
+</style>
+</head>
+<body>
+<div id="header">
+  <span>adbox screen</span>
+  <span id="status">connecting...</span>
+</div>
+<div id="viewport">
+  <canvas id="canvas"></canvas>
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const status = document.getElementById('status');
+let decoder = null;
+let videoWidth = 0;
+let videoHeight = 0;
+let isDown = false;
+
+function initDecoder() {
+  if (!('VideoDecoder' in window)) {
+    status.innerText = 'Error: WebCodecs not supported in this browser';
+    status.style.color = '#f44336';
+    return;
+  }
+  decoder = new VideoDecoder({
+    output: (frame) => {
+      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+        canvas.width = frame.displayWidth;
+        canvas.height = frame.displayHeight;
+        videoWidth = frame.displayWidth;
+        videoHeight = frame.displayHeight;
+      }
+      ctx.drawImage(frame, 0, 0);
+      frame.close();
+    },
+    error: (e) => {
+      console.error('decoder error:', e);
+      status.innerText = 'Decoder error: ' + e.message;
+    }
+  });
+}
+initDecoder();
+
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const ws = new WebSocket(wsProto + '//' + location.host + '/ws');
+ws.binaryType = 'arraybuffer';
+
+ws.onopen = () => {
+  status.innerText = 'live';
+  status.style.color = '#4caf50';
+};
+
+ws.onclose = () => {
+  status.innerText = 'disconnected';
+  status.style.color = '#f44336';
+};
+
+ws.onmessage = (e) => {
+  const data = new Uint8Array(e.data);
+  if (!decoder) return;
+
+  // Detect SPS/PPS NALU to configure decoder
+  // Typical NAL unit header: 0x00000001 or 0x000001 followed by type byte
+  // NAL type 7 is SPS (avc1)
+  let isKey = false;
+  let isConfig = false;
+
+  for (let i = 0; i < Math.min(data.length - 4, 32); i++) {
+    if (data[i] === 0 && data[i+1] === 0 && (data[i+2] === 1 || (data[i+2] === 0 && data[i+3] === 1))) {
+      const offset = (data[i+2] === 1) ? i + 3 : i + 4;
+      const nalType = data[offset] & 0x1f;
+      if (nalType === 7) isConfig = true;
+      if (nalType === 5) isKey = true;
+    }
+  }
+
+  if (isConfig || decoder.state === 'unconfigured') {
+    decoder.configure({
+      codec: 'avc1.64002a', // Baseline / High Profile
+      description: data,
+      optimizeForLatency: true
+    });
+    return;
+  }
+
+  if (decoder.state === 'configured') {
+    try {
+      decoder.decode(new EncodedVideoChunk({
+        type: isKey ? 'key' : 'delta',
+        timestamp: performance.now() * 1000,
+        data: data
+      }));
+    } catch (err) {
+      console.warn('decode chunk failed:', err);
+    }
+  }
+};
+
+// Touch / mouse interaction
+function sendTouch(action, e) {
+  if (videoWidth === 0 || videoHeight === 0 || ws.readyState !== WebSocket.OPEN) return;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = videoWidth / rect.width;
+  const scaleY = videoHeight / rect.height;
+  const clientX = e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+  const clientY = e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+  const x = Math.max(0, Math.min(videoWidth, Math.round((clientX - rect.left) * scaleX)));
+  const y = Math.max(0, Math.min(videoHeight, Math.round((clientY - rect.top) * scaleY)));
+
+  // 32-byte scrcpy inject touch packet
+  const buf = new ArrayBuffer(32);
+  const v = new DataView(buf);
+  v.setUint8(0, 2);               // TYPE_INJECT_TOUCH_EVENT
+  v.setUint8(1, action);          // 0=DOWN, 1=UP, 2=MOVE
+  v.setBigUint64(2, 0n);          // pointerId
+  v.setUint32(10, x);
+  v.setUint32(14, y);
+  v.setUint16(18, videoWidth);
+  v.setUint16(20, videoHeight);
+  v.setUint16(22, 0xffff);        // pressure 1.0
+  v.setUint32(24, 1);             // actionButton
+  v.setUint32(28, 1);             // buttons
+  ws.send(buf);
+}
+
+canvas.addEventListener('mousedown', (e) => { isDown = true; sendTouch(0, e); });
+window.addEventListener('mousemove', (e) => { if (isDown) sendTouch(2, e); });
+window.addEventListener('mouseup', (e) => { if (isDown) { isDown = false; sendTouch(1, e); } });
+
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); sendTouch(0, e); }, {passive:false});
+canvas.addEventListener('touchmove', (e) => { e.preventDefault(); sendTouch(2, e); }, {passive:false});
+canvas.addEventListener('touchend', (e) => { e.preventDefault(); sendTouch(1, e); }, {passive:false});
+</script>
+</body>
+</html>
+`

@@ -24,6 +24,7 @@ type ServerConfig struct {
 
 // Server knows how to connect to an adb server (no exec; server must already be running).
 type server interface {
+	DialAddress(addr string) (*wire.Conn, error)
 	Start() error
 	Dial() (*wire.Conn, error)
 }
@@ -127,4 +128,11 @@ func (s *realServer) Dial() (*wire.Conn, error) {
 // Start is not supported: this client does not exec adb. The adb server must already be running.
 func (s *realServer) Start() error {
 	return errors.WrapErrorf(nil, errors.ServerNotAvailable, "adb server must already be running (this client does not exec adb)")
+}
+
+func (s *realServer) DialAddress(addr string) (*wire.Conn, error) {
+	if s.config.Dialer != nil {
+		return s.config.Dialer.Dial(addr)
+	}
+	return (tcpDialer{}).Dial(addr)
 }

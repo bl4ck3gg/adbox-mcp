@@ -1,6 +1,7 @@
 package adb
 
 import (
+	"net"
 	"fmt"
 	"io"
 	"os"
@@ -720,4 +721,25 @@ func (c *Device) Pull(remotePath, localPath string) (int64, error) {
 	} else {
 		return n, fmt.Errorf("error: file size: %v, pull size: %v", info.Size, n)
 	}
+}
+
+// DialRemote dials a TCP host:port located on the machine hosting the adb server,
+// traversing the same SOCKS5 proxy or local route as the adb control connection.
+func (c *Device) DialRemote(host string, port int) (net.Conn, error) {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	// Look up the underlying dialer on the realServer
+	if rs, ok := c.server.(*realServer); ok {
+		if raw, ok := rs.config.Dialer.(RawDialer); ok {
+			conn, err := raw.DialRaw("tcp", addr)
+			if err != nil {
+				return nil, wrapClientError(err, c, "DialRemote(%s)", addr)
+			}
+			return conn, nil
+		}
+	}
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return nil, wrapClientError(err, c, "DialRemote(%s)", addr)
+	}
+	return conn, nil
 }

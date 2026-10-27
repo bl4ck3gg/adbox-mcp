@@ -70,6 +70,93 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		return textResult(map[string]any{"count": len(records), "devices": records})
 	})
 
+	// ── device_screen_* ──────────────────────────────────────────────────
+	type screenStartArgs struct {
+		Device       string `json:"device" jsonschema:"Device serial"`
+		MaxSize      int    `json:"max_size,omitempty" jsonschema:"Longest screen side in pixels (default 1080)"`
+		VideoBitRate int    `json:"video_bit_rate,omitempty" jsonschema:"Encoder bitrate in bps (default 4000000)"`
+	}
+	handle(srv, &mcp.Tool{
+		Name: "device_screen_start",
+		Description: "Start live screen streaming. Returns a web URL that renders the device screen " +
+			"in any Chromium browser via WebCodecs, with mouse/touch control. " +
+			"Scrcpy server is pushed on demand; port is chosen by the OS.",
+	}, func(ctx context.Context, args screenStartArgs) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		url, err := s.screen.Start(dev, rec.Serial, args.MaxSize, args.VideoBitRate)
+		if err != nil {
+			return errResult("start screen: %v", err)
+		}
+		return textResult(map[string]any{
+			"device":   rec.Serial,
+			"endpoint": rec.Endpoint,
+			"url":      url,
+			"alive":    true,
+		})
+	})
+
+	type screenStopArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_screen_stop",
+		Description: "Stop the screen stream for a device.",
+	}, func(ctx context.Context, args screenStopArgs) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		_ = dev
+		stopped := s.screen.Stop(rec.Serial)
+		return textResult(map[string]any{"device": rec.Serial, "stopped": stopped})
+	})
+
+	type screenTapArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+		X      int    `json:"x" jsonschema:"X in device pixels (same space as ui_dump bounds)"`
+		Y      int    `json:"y" jsonschema:"Y in device pixels (same space as ui_dump bounds)"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_screen_tap",
+		Description: "Tap at device pixel coordinates through the live screen control channel (requires device_screen_start).",
+	}, func(ctx context.Context, args screenTapArgs) (*mcp.CallToolResult, error) {
+		_, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("no active screen session for %s; call device_screen_start first", rec.Serial)
+		}
+		sess.InjectTouch(0, args.X, args.Y) // down
+		sess.InjectTouch(1, args.X, args.Y) // up
+		return textResult(map[string]any{"device": rec.Serial, "x": args.X, "y": args.Y, "ok": true})
+	})
+
+	type screenKeyArgs struct {
+		Device  string `json:"device" jsonschema:"Device serial"`
+		Keycode int    `json:"keycode" jsonschema:"Android KEYCODE_* value, e.g. 4=back, 3=home, 26=power"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_screen_key",
+		Description: "Send an Android key event through the live screen control channel.",
+	}, func(ctx context.Context, args screenKeyArgs) (*mcp.CallToolResult, error) {
+		_, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("no active screen session for %s", rec.Serial)
+		}
+		sess.InjectKeycode(0, args.Keycode)
+		sess.InjectKeycode(1, args.Keycode)
+		return textResult(map[string]any{"device": rec.Serial, "keycode": args.Keycode, "ok": true})
+	})
+
 	// ── device_reboot ────────────────────────────────────────────────────
 	type rebootArgs struct {
 		Device string `json:"device" jsonschema:"Device serial"`

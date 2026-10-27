@@ -5,3 +5,6 @@
 -keep class android.content.IOnPrimaryClipChangedListener** { *; }
 -keep class android.content.IContentProvider** { *; }
 -dontwarn android.**
+
+-dontobfuscate
+-keep class mr.robot.agent.scrcpy.** { *; }

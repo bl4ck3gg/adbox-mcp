@@ -115,3 +115,8 @@ func (d *SOCKS5Dialer) dialWithTimeout(address string) (net.Conn, error) {
 func (d *SOCKS5Dialer) DialTCP(address string) (net.Conn, error) {
 	return d.dialWithTimeout(address)
 }
+
+// DialRaw connects directly using the underlying SOCKS5 proxy dialer, returning a plain net.Conn.
+func (d *SOCKS5Dialer) DialRaw(network, address string) (net.Conn, error) {
+	return d.dialer.Dial(network, address)
+}

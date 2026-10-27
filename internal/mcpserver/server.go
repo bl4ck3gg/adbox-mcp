@@ -27,15 +27,21 @@ import (
 
 	"adbox-mcp/internal/endpoint"
 	"adbox-mcp/internal/tasks"
+	"adbox-mcp/internal/tether"
 )
 
 type Server struct {
-	mgr   *endpoint.Manager
-	tasks *tasks.Registry
+	mgr    *endpoint.Manager
+	tasks  *tasks.Registry
+	tether *tether.Manager
 }
 
 func New(mgr *endpoint.Manager) *Server {
-	return &Server{mgr: mgr, tasks: tasks.NewRegistry()}
+	return &Server{
+		mgr:    mgr,
+		tasks:  tasks.NewRegistry(),
+		tether: tether.NewManager(),
+	}
 }
 
 // Run serves MCP over stdio until the context is cancelled.

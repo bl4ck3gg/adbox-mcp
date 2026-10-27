@@ -567,6 +567,109 @@ func (s *Server) registerTools(srv *mcp.Server) {
 	}, func(ctx context.Context, args taskCancelArgs) (*mcp.CallToolResult, error) {
 		return textResult(map[string]any{"ok": s.tasks.Cancel(args.TaskID)})
 	})
+	// ── device_tether_start / stop / list ────────────────────────────────
+	type tetherArgs struct {
+		Device   string `json:"device" jsonschema:"Device serial"`
+		Port     int    `json:"port,omitempty" jsonschema:"Host port for the relay (default 31416)"`
+		Remote   string `json:"remote,omitempty" jsonschema:"Device-side socket name (default localabstract:gnirehtet)"`
+		Activity string `json:"activity,omitempty" jsonschema:"Activity to start the VPN (default com.genymobile.gnirehtet/.GnirehtetActivity)"`
+	}
+	handle(srv, &mcp.Tool{
+		Name: "device_tether_start",
+		Description: "Tether the device over adb: runs a user-space TCP/IP relay in this process, " +
+			"reverses localabstract:gnirehtet to it, and launches GnirehtetActivity to request the VPN. " +
+			"A human must tap OK on the connection request dialog.",
+	}, func(ctx context.Context, args tetherArgs) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		port := args.Port
+		if port <= 0 {
+			port = 31416
+		}
+		remote := args.Remote
+		if remote == "" {
+			remote = "localabstract:gnirehtet"
+		}
+		activity := args.Activity
+		if activity == "" {
+			activity = "com.genymobile.gnirehtet/.GnirehtetActivity"
+		}
+
+		session, err := s.tether.Start(rec.Serial, port)
+		if err != nil {
+			return errResult("start relay: %v", err)
+		}
+
+		remSpec, perr := parseForwardSpec(remote)
+		if perr != nil {
+			return errResult("parse remote: %v", perr)
+		}
+		locSpec, perr := parseForwardSpec("tcp:" + strconv.Itoa(port))
+		if perr != nil {
+			return errResult("parse local: %v", perr)
+		}
+		if rerr := dev.Reverse(remSpec, locSpec); rerr != nil {
+			return errResult("adb reverse %s -> tcp:%d: %v", remote, port, rerr)
+		}
+
+		// Exclude the shell's own uid from the tunnel, or tethering eats its own
+		// control channel.
+		//
+		// adbd runs as uid 2000, which the platform knows as com.android.shell. If
+		// the VPN captures that uid's traffic, the adb connection itself starts
+		// flowing through the tunnel it is carrying -- and the moment the tunnel
+		// needs that connection to stay up, the two depend on each other. Over USB
+		// it survives by accident; over Wi-Fi, where adb IS the network, it is a
+		// self-inflicted disconnect.
+		//
+		// The same package also covers the app_process children this tool starts
+		// (they inherit uid 2000), so a spawned bridge never tunnels its own
+		// control socket either.
+		disallowed := []string{"com.android.shell"}
+
+		// Build the intent with an explicit string-array extra. am's --esa takes a
+		// comma-separated list and refuses empty entries, so a single package is
+		// passed as one value.
+		startCmd := "am start -a com.genymobile.gnirehtet.START -n " + activity +
+			" --esa disallowedApplications " + strings.Join(disallowed, ",")
+		// -W is deliberately omitted: the system then shows a consent dialog, and
+		// waiting for a human inside a tool call is how a call becomes a timeout.
+		out, aerr := dev.RunCommand(startCmd)
+
+		return textResult(map[string]any{
+			"device":      rec.Serial,
+			"endpoint":    rec.Endpoint,
+			"relay_port":  session.Port,
+			"reverse":     remote + " -> tcp:" + strconv.Itoa(port),
+			"activity_ok": aerr == nil,
+			"output":      strings.TrimSpace(out),
+			"prompt":      "TAP OK ON THE PHONE SCREEN NOW: VpnService.prepare() needs human consent",
+		})
+	})
+
+	handle(srv, &mcp.Tool{
+		Name:        "device_tether_stop",
+		Description: "Stop tethering: kill VPN, remove reverse forward, stop relay.",
+	}, func(ctx context.Context, args struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+	}) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		remSpec, _ := parseForwardSpec("localabstract:gnirehtet")
+		_ = dev.ReverseRemove(remSpec)
+		s.tether.Stop(rec.Serial)
+		out, _ := dev.RunCommand("am force-stop com.genymobile.gnirehtet")
+		return textResult(map[string]any{
+			"device":  rec.Serial,
+			"stopped": true,
+			"output":  strings.TrimSpace(out),
+		})
+	})
+
 }
 
 func parseForwardSpec(spec string) (adb.ForwardSpec, error) {
@@ -591,4 +694,19 @@ func parseForwardSpec(spec string) (adb.ForwardSpec, error) {
 // shellQuote wraps a command in single quotes for safe embedding in a shell line.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// vpnNextStep reports whether the VPN is actually running or still waiting for a
+// human, because those two states look identical from the outside otherwise.
+//
+// Installing a VpnService always requires a tap on a system dialog. No permission
+// grant, no shell command, and no amount of adb can substitute for it -- the
+// consent exists precisely so that a machine cannot do it silently.
+func vpnNextStep(dev *adb.Device) string {
+	iface, _ := dev.RunCommand("ip addr show tun0 2>/dev/null | head -1")
+	if strings.Contains(iface, "tun0") {
+		return "tun0 is up: the device is tethered, traffic now crosses the adb tunnel"
+	}
+	return "waiting for human consent: tap OK on the device's VPN connection dialog " +
+		"(VpnService.prepare() requires it and adb cannot grant it)"
 }

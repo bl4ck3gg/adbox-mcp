@@ -606,6 +606,12 @@ func (s *Session) readAudioLoop(conn net.Conn) {
 
 // UhidIDs are the virtual device ids we register. They only need to be unique
 // within this connection.
+// KeyEvent actions, shared with MotionEvent: 0 down, 1 up.
+const (
+	keyActionDown = 0
+	keyActionUp   = 1
+)
+
 const (
 	uhidKeyboard = 1
 	uhidMouse    = 2
@@ -768,6 +774,17 @@ func (s *Session) VideoEnabled() bool { return s.videoOn.Load() }
 
 // UhidEnabled reports whether virtual HID devices are registered.
 func (s *Session) UhidEnabled() bool { return s.uhidOn.Load() }
+
+// Back presses BACK, or turns the screen on when it is off.
+//
+// A back press is two messages, not one: the device injects KEYCODE_BACK with
+// whatever action we send, so a lone ACTION_DOWN leaves the key logically held
+// and the next back does nothing. The screen-off branch ignores ACTION_UP, which
+// is why sending both is safe in either state.
+func (s *Session) Back() {
+	s.InjectRawControl(BackOrScreenOn(keyActionDown))
+	s.InjectRawControl(BackOrScreenOn(keyActionUp))
+}
 
 // RequestKeyFrame asks the encoder to emit an IDR now. A viewer that fell behind
 // or a decoder that lost state recovers on the next keyframe rather than waiting

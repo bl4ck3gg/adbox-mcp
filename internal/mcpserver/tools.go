@@ -249,8 +249,8 @@ func (s *Server) registerTools(srv *mcp.Server) {
 			sess.InjectRawControl(screen.ExpandSettingsPanel())
 		case "collapse_panels":
 			sess.InjectRawControl(screen.CollapsePanels())
-		case "back_or_wake":
-			sess.InjectRawControl(screen.BackOrScreenOn(0))
+		case "back", "back_or_wake":
+			sess.Back()
 		case "reset_video":
 			sess.InjectRawControl(screen.ResetVideo())
 		case "power", "wake", "sleep":

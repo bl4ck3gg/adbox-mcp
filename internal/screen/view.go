@@ -348,6 +348,14 @@ function sendScroll(x, y, h, v) {
 }
 
 function sendSimple(type) { send(new Uint8Array([type])); }
+
+// BACK_OR_SCREEN_ON: the device injects KEYCODE_BACK when the screen is on, and
+// wakes the screen when it is off. Both bytes are needed -- a lone DOWN leaves
+// the key held and the next back is swallowed.
+function sendBack() {
+  send(new Uint8Array([MSG_BACK_WAKE, 0]));
+  send(new Uint8Array([MSG_BACK_WAKE, 1]));
+}
 function sendClipboard(text, paste) {
   const enc = new TextEncoder().encode(text);
   const b = new ArrayBuffer(14 + enc.length), v = new DataView(b);
@@ -375,7 +383,13 @@ function toVideo(ev) {
 
 let pointerDown = false;
 
-canvas.addEventListener('mousedown', (e) => { e.preventDefault(); pointerDown = true; const p = toVideo(e); sendTouch(ACTION_DOWN, p.x, p.y); });
+canvas.addEventListener('mousedown', (e) => {
+  // Right click is BACK, the way it is in scrcpy. It also makes trackpad
+  // two-finger tap work, since the OS delivers that as a right click.
+  if (e.button === 2) { e.preventDefault(); sendBack(); return; }
+  if (e.button !== 0) return;
+  e.preventDefault(); pointerDown = true; const p = toVideo(e); sendTouch(ACTION_DOWN, p.x, p.y);
+});
 canvas.addEventListener('mousemove', (e) => { if (!pointerDown) return; const p = toVideo(e); sendTouch(ACTION_MOVE, p.x, p.y); });
 window.addEventListener('mouseup',  (e) => { if (!pointerDown) return; pointerDown = false; const p = toVideo(e); sendTouch(ACTION_UP, p.x, p.y); });
 
@@ -403,8 +417,35 @@ function sendTouchPointer(action, id, x, y, pressure) {
   send(b);
 }
 
+// Two-finger tap is BACK, matching the gesture Android users already know.
+//
+// The fingers are never forwarded to the device in that case: a two-finger tap
+// would otherwise register as a pinch or a two-pointer click in whatever app is
+// in front. So the gesture is decided at touchstart and either consumed here or
+// forwarded as real pointers -- never both.
+let gestureMode = null;        // null | 'two-finger-back' | 'multi'
+let gestureStartTime = 0;
+let gestureStartPoints = [];
+
 canvas.addEventListener('touchstart', (e) => {
   e.preventDefault();
+
+  if (e.touches.length === 2 && gestureMode === null) {
+    gestureStartTime = Date.now();
+    gestureStartPoints = Array.from(e.touches).map(t => touchToVideo(t));
+    gestureMode = 'two-finger-back';
+    return;
+  }
+  if (gestureMode === 'two-finger-back') {
+    // A third finger arrived: this is a multi-touch gesture, not a tap. Hand
+    // everything over as pointers so pinch still works from here on.
+    gestureMode = 'multi';
+    for (const t of e.touches) {
+      const p = touchToVideo(t);
+      sendTouchPointer(ACTION_DOWN, t.identifier, p.x, p.y);
+    }
+    return;
+  }
   for (const t of e.changedTouches) {
     const p = touchToVideo(t);
     sendTouchPointer(ACTION_DOWN, t.identifier, p.x, p.y);
@@ -413,6 +454,24 @@ canvas.addEventListener('touchstart', (e) => {
 
 canvas.addEventListener('touchmove', (e) => {
   e.preventDefault();
+  if (gestureMode === 'two-finger-back') {
+    // Fingers drifting means a pinch, not a tap. Promote to real pointers from
+    // the original positions so the device sees the whole gesture.
+    let moved = false;
+    for (let i = 0; i < Math.min(2, e.touches.length); i++) {
+      const p = touchToVideo(e.touches[i]);
+      const s0 = gestureStartPoints[i];
+      if (Math.abs(p.x - s0.x) > 16 || Math.abs(p.y - s0.y) > 16) moved = true;
+    }
+    if (moved) {
+      gestureMode = 'multi';
+      for (const t of e.touches) {
+        const p = touchToVideo(t);
+        sendTouchPointer(ACTION_DOWN, t.identifier, p.x, p.y);
+      }
+    }
+    return;
+  }
   for (const t of e.changedTouches) {
     const p = touchToVideo(t);
     sendTouchPointer(ACTION_MOVE, t.identifier, p.x, p.y);
@@ -421,6 +480,15 @@ canvas.addEventListener('touchmove', (e) => {
 
 canvas.addEventListener('touchend', (e) => {
   e.preventDefault();
+
+  if (gestureMode === 'two-finger-back') {
+    // A tap, not a drag: both fingers were down briefly and stayed put.
+    if (Date.now() - gestureStartTime < 400) sendBack();
+    gestureMode = null;
+    gestureStartPoints = [];
+    return;
+  }
+  if (e.touches.length === 0) gestureMode = null;
   for (const t of e.changedTouches) {
     const p = touchToVideo(t);
     sendTouchPointer(ACTION_UP, t.identifier, p.x, p.y, 0);
@@ -428,11 +496,16 @@ canvas.addEventListener('touchend', (e) => {
 }, {passive:false});
 
 canvas.addEventListener('touchcancel', (e) => {
+  gestureMode = null;
+  gestureStartPoints = [];
   for (const t of e.changedTouches) {
     const p = touchToVideo(t);
     sendTouchPointer(ACTION_UP, t.identifier, p.x, p.y, 0);
   }
 }, {passive:false});
+
+// Without this the context menu opens over the screen on every right click.
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
 // Wheel scrolls the device rather than the page.
 canvas.addEventListener('wheel', (e) => {

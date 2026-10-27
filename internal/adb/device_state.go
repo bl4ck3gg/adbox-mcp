@@ -2,7 +2,6 @@ package adb
 
 import (
 	"adbox-mcp/internal/adb/internal/errors"
-	"fmt"
 	"strings"
 )
 
@@ -41,8 +40,7 @@ func parseDeviceState(str string) (DeviceState, error) {
 	if !ok {
 		// 对于未知状态，返回 StateOffline 而不是 StateInvalid，更健壮
 		// 注意：这里返回错误，但调用方会处理并继续
-		errMsg := fmt.Sprintf("invalid device state: %q (length: %d)", str, len(str))
-		return StateOffline, errors.Errorf(errors.ParseError, errMsg)
+		return StateOffline, errors.Errorf(errors.ParseError, "invalid device state: %q (length: %d)", str, len(str))
 	}
 	return state, nil
 }

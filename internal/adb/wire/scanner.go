@@ -127,7 +127,7 @@ func readOctetString(description string, r io.Reader) (string, error) {
 	if err == io.ErrUnexpectedEOF {
 		return "", errIncompleteMessage(description, n, 4)
 	} else if err != nil {
-		return "", errors.WrapErrorf(err, errors.NetworkError, "error reading "+description)
+		return "", errors.WrapErrorf(err, errors.NetworkError, "error reading %s", description)
 	}
 
 	return string(octet), nil

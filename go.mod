@@ -9,8 +9,6 @@ require (
 
 require github.com/gorilla/websocket v1.5.3
 
-require golang.org/x/crypto v0.35.0 // indirect
-
 require (
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.8.0

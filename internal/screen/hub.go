@@ -31,8 +31,9 @@ type Hub struct {
 	// Video parameters are read concurrently by handlers, updated atomically
 	spsPps  atomic.Pointer[[]byte]
 	lastKey atomic.Pointer[[]byte]
-	width   atomic.Int32
-	height  atomic.Int32
+	width    atomic.Int32
+	height   atomic.Int32
+	rotation atomic.Int32
 }
 
 func newHub() *Hub {

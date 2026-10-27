@@ -32,9 +32,11 @@ type Session struct {
 	running   atomic.Bool
 	hub       *Hub
 
-	controlConn atomic.Pointer[net.Conn]
-	httpListener net.Listener
-	httpPort     int
+	controlConn   atomic.Pointer[net.Conn]
+	lastClipboard atomic.Pointer[string]
+	clipSeq       atomic.Uint64
+	httpListener  net.Listener
+	httpPort      int
 }
 
 var (
@@ -139,6 +141,10 @@ func (s *Session) Start() (webUrl string, err error) {
 
 	// 7. Start fanout hub loop (pure channel-based)
 	go s.hub.Run()
+
+	// Drain device messages for the life of the session. Not doing this backs up
+	// the control socket and stalls clipboard and geometry updates.
+	go s.readControlLoop(controlConn)
 
 	// 8. Start HTTP viewer server
 	bindHost := os.Getenv("ADBOX_SCREEN_HOST")
@@ -308,33 +314,128 @@ func (s *Session) InjectRawControl(data []byte) {
 	}
 }
 
-func (s *Session) InjectTouch(action int, x, y int) {
-	w := int(s.hub.width.Load())
-	h := int(s.hub.height.Load())
-	if w <= 0 { w = 1080 }
-	if h <= 0 { h = 2220 }
-
-	buf := make([]byte, 32)
-	buf[0] = 2 // TYPE_INJECT_TOUCH_EVENT
-	buf[1] = byte(action)
-	binary.BigEndian.PutUint64(buf[2:10], 0)
-	binary.BigEndian.PutUint32(buf[10:14], uint32(x))
-	binary.BigEndian.PutUint32(buf[14:18], uint32(y))
-	binary.BigEndian.PutUint16(buf[18:20], uint16(w))
-	binary.BigEndian.PutUint16(buf[20:22], uint16(h))
-	binary.BigEndian.PutUint16(buf[22:24], 0xffff)
-	binary.BigEndian.PutUint32(buf[24:28], 1)
-	binary.BigEndian.PutUint32(buf[28:32], 1)
-
-	s.InjectRawControl(buf)
+// geometry is the last display geometry the device reported. Rotation changes
+// what the video's width/height mean, so it has to be tracked.
+type geometry struct {
+	rotation int32
+	width    int32
+	height   int32
 }
 
-func (s *Session) InjectKeycode(action, keycode int) {
-	buf := make([]byte, 14)
-	buf[0] = 0 // TYPE_INJECT_KEYCODE
-	buf[1] = byte(action)
-	binary.BigEndian.PutUint32(buf[2:6], uint32(keycode))
-	binary.BigEndian.PutUint32(buf[6:10], 0)
-	binary.BigEndian.PutUint32(buf[10:14], 0)
-	s.InjectRawControl(buf)
+// readControlLoop consumes device messages. The server writes clipboard contents
+// and display-geometry changes here, and a socket nobody reads eventually backs
+// up and stalls the control channel -- so this runs for the session's whole life
+// even when no client asks for anything.
+func (s *Session) readControlLoop(conn net.Conn) {
+	buf := make([]byte, 0, 4096)
+	chunk := make([]byte, 2048)
+	for s.running.Load() {
+		n, err := conn.Read(chunk)
+		if err != nil {
+			return
+		}
+		buf = append(buf, chunk[:n]...)
+
+		for {
+			ev, consumed, perr := ParseDeviceEvent(buf)
+			if perr != nil {
+				buf = buf[:0]
+				break
+			}
+			if ev == nil {
+				break // need more bytes
+			}
+			buf = buf[consumed:]
+
+			switch ev.Type {
+			case devClipboard:
+				s.lastClipboard.Store(&ev.Text)
+			case devDisplayGeometry:
+				s.hub.rotation.Store(int32(ev.Rotation))
+				if ev.Width > 0 && ev.Height > 0 {
+					s.hub.width.Store(int32(ev.Width))
+					s.hub.height.Store(int32(ev.Height))
+				}
+			}
+		}
+	}
+}
+
+// InjectTouch sends a touch event in VIDEO pixel coordinates, which the device
+// maps onto its real display using the width and height carried in the packet.
+func (s *Session) InjectTouch(action, x, y int) {
+	w := int(s.hub.width.Load())
+	h := int(s.hub.height.Load())
+	if w <= 0 || h <= 0 {
+		return // dimensions unknown yet; a wrong-size packet taps the wrong place
+	}
+	buttons := ButtonPrimary
+	if action == ActionUp {
+		buttons = ButtonNone
+	}
+	s.InjectRawControl(InjectTouch(action, 0, x, y, w, h, 0xFFFF, buttons, buttons))
+}
+
+// InjectSwipe drives a complete down-move-up gesture.
+func (s *Session) InjectSwipe(x1, y1, x2, y2 int, durationMs int) {
+	if durationMs <= 0 {
+		durationMs = 200
+	}
+	const steps = 12
+	s.InjectTouch(ActionDown, x1, y1)
+	for i := 1; i <= steps; i++ {
+		f := float64(i) / float64(steps)
+		x := x1 + int(float64(x2-x1)*f)
+		y := y1 + int(float64(y2-y1)*f)
+		s.InjectTouch(ActionMove, x, y)
+		time.Sleep(time.Duration(durationMs/steps) * time.Millisecond)
+	}
+	s.InjectTouch(ActionUp, x2, y2)
+}
+
+// InjectKeycode sends a full press (down then up).
+func (s *Session) InjectKeycode(keycode int) {
+	s.InjectRawControl(InjectKeycode(0, keycode, 0, 0))
+	s.InjectRawControl(InjectKeycode(1, keycode, 0, 0))
+}
+
+// InjectText types text through the device, which is how non-ASCII works: the
+// keystroke path only carries keycodes.
+func (s *Session) InjectText(text string) {
+	s.InjectRawControl(InjectText(text))
+}
+
+// InjectScroll sends a scroll event at a position, in video coordinates.
+func (s *Session) InjectScroll(x, y int, hScroll, vScroll float64) {
+	w := int(s.hub.width.Load())
+	h := int(s.hub.height.Load())
+	if w <= 0 || h <= 0 {
+		return
+	}
+	s.InjectRawControl(InjectScroll(x, y, w, h, hScroll, vScroll, 0))
+}
+
+// SetClipboard pushes text to the device clipboard. paste also pastes it.
+func (s *Session) SetClipboard(text string, paste bool) {
+	seq := s.clipSeq.Add(1)
+	s.InjectRawControl(SetClipboard(seq, text, paste))
+}
+
+// Clipboard returns the last clipboard text the device reported.
+func (s *Session) Clipboard() string {
+	if p := s.lastClipboard.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// RefreshClipboard asks the device to send its current clipboard.
+func (s *Session) RefreshClipboard() {
+	s.InjectRawControl(GetClipboard(0))
+}
+
+// Tap is a complete down-up at one point, in video pixel coordinates.
+func (s *Session) Tap(x, y int) {
+	s.InjectTouch(ActionDown, x, y)
+	s.InjectTouch(ActionUp, x, y)
 }

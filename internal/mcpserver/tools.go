@@ -13,6 +13,7 @@ import (
 
 	"adbox-mcp/internal/adb"
 	"adbox-mcp/internal/embedded"
+	"adbox-mcp/internal/screen"
 	"adbox-mcp/internal/tasks"
 )
 
@@ -131,8 +132,7 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		if !ok {
 			return errResult("no active screen session for %s; call device_screen_start first", rec.Serial)
 		}
-		sess.InjectTouch(0, args.X, args.Y) // down
-		sess.InjectTouch(1, args.X, args.Y) // up
+		sess.Tap(args.X, args.Y)
 		return textResult(map[string]any{"device": rec.Serial, "x": args.X, "y": args.Y, "ok": true})
 	})
 
@@ -152,9 +152,141 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		if !ok {
 			return errResult("no active screen session for %s", rec.Serial)
 		}
-		sess.InjectKeycode(0, args.Keycode)
-		sess.InjectKeycode(1, args.Keycode)
+		sess.InjectKeycode(args.Keycode)
 		return textResult(map[string]any{"device": rec.Serial, "keycode": args.Keycode, "ok": true})
+	})
+
+	type screenSwipeArgs struct {
+		Device     string `json:"device" jsonschema:"Device serial"`
+		X1         int    `json:"x1" jsonschema:"Start X in device pixels"`
+		Y1         int    `json:"y1" jsonschema:"Start Y in device pixels"`
+		X2         int    `json:"x2" jsonschema:"End X in device pixels"`
+		Y2         int    `json:"y2" jsonschema:"End Y in device pixels"`
+		DurationMs int    `json:"duration_ms,omitempty" jsonschema:"Gesture duration in ms (default 200)"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_screen_swipe",
+		Description: "Swipe through the live control channel with interpolated move events, which is what scrolling lists and dismissing notifications need.",
+	}, func(ctx context.Context, args screenSwipeArgs) (*mcp.CallToolResult, error) {
+		_, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("no active screen session for %s", rec.Serial)
+		}
+		sess.InjectSwipe(args.X1, args.Y1, args.X2, args.Y2, args.DurationMs)
+		return textResult(map[string]any{"device": rec.Serial, "ok": true})
+	})
+
+	type screenTextArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+		Text   string `json:"text" jsonschema:"Text to type (UTF-8; non-ASCII works here, unlike keystrokes)"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_screen_text",
+		Description: "Type text into the focused field over the control channel. Handles Unicode; the keystroke path only carries keycodes.",
+	}, func(ctx context.Context, args screenTextArgs) (*mcp.CallToolResult, error) {
+		_, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("no active screen session for %s", rec.Serial)
+		}
+		sess.InjectText(args.Text)
+		return textResult(map[string]any{"device": rec.Serial, "chars": len(args.Text), "ok": true})
+	})
+
+	type screenScrollArgs struct {
+		Device  string  `json:"device" jsonschema:"Device serial"`
+		X       int     `json:"x" jsonschema:"X in device pixels"`
+		Y       int     `json:"y" jsonschema:"Y in device pixels"`
+		HScroll float64 `json:"h_scroll,omitempty" jsonschema:"Horizontal scroll, positive scrolls right"`
+		VScroll float64 `json:"v_scroll,omitempty" jsonschema:"Vertical scroll, positive scrolls down"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_screen_scroll",
+		Description: "Scroll at a point without a touch gesture.",
+	}, func(ctx context.Context, args screenScrollArgs) (*mcp.CallToolResult, error) {
+		_, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("no active screen session for %s", rec.Serial)
+		}
+		sess.InjectScroll(args.X, args.Y, args.HScroll, args.VScroll)
+		return textResult(map[string]any{"device": rec.Serial, "ok": true})
+	})
+
+	type screenActionArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+		Action string `json:"action" jsonschema:"rotate | power | expand_notifications | expand_settings | collapse_panels | back_or_wake | reset_video | wake | sleep"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_screen_action",
+		Description: "Device actions that do not need coordinates: rotate the display, toggle the panel power, open notification/settings panels, or reset the video encoder.",
+	}, func(ctx context.Context, args screenActionArgs) (*mcp.CallToolResult, error) {
+		_, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("no active screen session for %s", rec.Serial)
+		}
+		switch args.Action {
+		case "rotate":
+			sess.InjectRawControl(screen.RotateDevice())
+		case "expand_notifications":
+			sess.InjectRawControl(screen.ExpandNotificationPanel())
+		case "expand_settings":
+			sess.InjectRawControl(screen.ExpandSettingsPanel())
+		case "collapse_panels":
+			sess.InjectRawControl(screen.CollapsePanels())
+		case "back_or_wake":
+			sess.InjectRawControl(screen.BackOrScreenOn(0))
+		case "reset_video":
+			sess.InjectRawControl(screen.ResetVideo())
+		case "power", "wake", "sleep":
+			// The panel power message flips the display without touching
+			// wakefulness, which is what keeps uiautomator working while dark.
+			sess.InjectRawControl(screen.SetDisplayPower(args.Action == "wake"))
+		default:
+			return errResult("unknown action %q", args.Action)
+		}
+		return textResult(map[string]any{"device": rec.Serial, "action": args.Action, "ok": true})
+	})
+
+	type screenClipArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+		Text   string `json:"text,omitempty" jsonschema:"Text to put on the device clipboard. Omit to read the current one."`
+		Paste  bool   `json:"paste,omitempty" jsonschema:"Also paste it into the focused field"`
+	}
+	handle(srv, &mcp.Tool{
+		Name: "device_screen_clipboard",
+		Description: "Read or write the device clipboard. Writing with paste=true inserts text far faster and " +
+			"more reliably than typing it, especially for long or non-ASCII strings.",
+	}, func(ctx context.Context, args screenClipArgs) (*mcp.CallToolResult, error) {
+		_, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		sess, ok := s.screen.Get(rec.Serial)
+		if !ok {
+			return errResult("no active screen session for %s", rec.Serial)
+		}
+		if args.Text == "" {
+			sess.RefreshClipboard()
+			time.Sleep(300 * time.Millisecond)
+			return textResult(map[string]any{"device": rec.Serial, "clipboard": sess.Clipboard()})
+		}
+		sess.SetClipboard(args.Text, args.Paste)
+		return textResult(map[string]any{"device": rec.Serial, "written": len(args.Text), "pasted": args.Paste, "ok": true})
 	})
 
 	// ── device_reboot ────────────────────────────────────────────────────

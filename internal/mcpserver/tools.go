@@ -70,6 +70,34 @@ func (s *Server) registerTools(srv *mcp.Server) {
 		return textResult(map[string]any{"count": len(records), "devices": records})
 	})
 
+	// ── device_reboot ────────────────────────────────────────────────────
+	type rebootArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+		Mode   string `json:"mode,omitempty" jsonschema:"Reboot mode: system (default), recovery, or bootloader"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_reboot",
+		Description: "Reboot the device. Uses 'svc power reboot' by default, which works under uid 2000 without root.",
+	}, func(ctx context.Context, args rebootArgs) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		cmd := "svc power reboot"
+		if args.Mode == "recovery" || args.Mode == "bootloader" {
+			cmd = "reboot " + args.Mode
+		}
+		// The connection drops immediately when the kernel starts tearing down,
+		// so an error or EOF is the normal success path.
+		_, _ = dev.RunCommand(cmd)
+		return textResult(map[string]any{
+			"device":   rec.Serial,
+			"endpoint": rec.Endpoint,
+			"mode":     args.Mode,
+			"rebooting": true,
+		})
+	})
+
 	// ── device_shell ─────────────────────────────────────────────────────
 	type shellArgs struct {
 		Device  string `json:"device" jsonschema:"Device serial (optional: serial@endpoint to disambiguate)"`

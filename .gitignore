@@ -1,0 +1,4 @@
+/adbox-mcp
+*.exe
+/dist/
+.DS_Store

@@ -1,0 +1,340 @@
+package mcpserver
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"adbox-mcp/internal/adb"
+)
+
+type emptyArgs struct{}
+
+func handle[In any](srv *mcp.Server, tool *mcp.Tool, fn func(ctx context.Context, in In) (*mcp.CallToolResult, error)) {
+	mcp.AddTool(srv, tool, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
+		res, err := fn(ctx, in)
+		return res, nil, err
+	})
+}
+func (s *Server) registerTools(srv *mcp.Server) {
+	// ── endpoints ────────────────────────────────────────────────────────
+	handle(srv, &mcp.Tool{
+		Name:        "endpoints_list",
+		Description: "List all registered ADB daemon endpoints, with reachability status and the proxy each uses.",
+	}, func(ctx context.Context, _ emptyArgs) (*mcp.CallToolResult, error) {
+		return textResult(s.mgr.ListEndpoints())
+	})
+
+	type addEndpointArgs struct {
+		Spec string `json:"spec" jsonschema:"Endpoint specification: adb=host:port[,name=alias][,proxy=socks5://host:port]"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "endpoints_add",
+		Description: "Register an ADB daemon endpoint. The spec accepts adb=host:port, name=alias, and proxy=socks5://host:port to tunnel through an SSH dynamic forward.",
+	}, func(ctx context.Context, args addEndpointArgs) (*mcp.CallToolResult, error) {
+		id, err := s.mgr.AddEndpoint(args.Spec)
+		if err != nil {
+			return errResult("add endpoint: %v", err)
+		}
+		return textResult(map[string]any{"ok": true, "endpoint_id": id})
+	})
+
+	type removeEndpointArgs struct {
+		Target string `json:"target" jsonschema:"Endpoint ID, alias, or host:port to remove"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "endpoints_remove",
+		Description: "Unregister an ADB daemon endpoint by its ID, alias, or host:port.",
+	}, func(ctx context.Context, args removeEndpointArgs) (*mcp.CallToolResult, error) {
+		ok := s.mgr.RemoveEndpoint(args.Target)
+		return textResult(map[string]any{"ok": ok})
+	})
+
+	// ── devices ──────────────────────────────────────────────────────────
+	handle(srv, &mcp.Tool{
+		Name:        "devices_list",
+		Description: "List every Android device visible on any active endpoint, with serial, model, state, and the endpoint it belongs to.",
+	}, func(ctx context.Context, _ emptyArgs) (*mcp.CallToolResult, error) {
+		records, err := s.mgr.ListDevices()
+		if err != nil {
+			return errResult("list devices: %v", err)
+		}
+		return textResult(map[string]any{"count": len(records), "devices": records})
+	})
+
+	// ── device_shell ─────────────────────────────────────────────────────
+	type shellArgs struct {
+		Device  string `json:"device" jsonschema:"Device serial (optional: serial@endpoint to disambiguate)"`
+		Command string `json:"command" jsonschema:"Shell command line to execute on the device"`
+		Timeout int    `json:"timeout_seconds,omitempty" jsonschema:"Execution timeout in seconds (default 30)"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_shell",
+		Description: "Run a shell command on an Android device and return its output. This speaks the native adb shell protocol, not an agent.",
+	}, func(ctx context.Context, args shellArgs) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		to := 30 * time.Second
+		if args.Timeout > 0 {
+			to = time.Duration(args.Timeout) * time.Second
+		}
+		type res struct {
+			out string
+			err error
+		}
+		done := make(chan res, 1)
+		go func() {
+			out, err := dev.RunCommand(args.Command)
+			done <- res{out: out, err: err}
+		}()
+		select {
+		case r := <-done:
+			if r.err != nil {
+				return errResult("shell: %v (output so far: %q)", r.err, r.out)
+			}
+			return textResult(map[string]any{
+				"device":   rec.Serial,
+				"endpoint": rec.Endpoint,
+				"output":   r.out,
+			})
+		case <-time.After(to):
+			return errResult("command timed out after %v", to)
+		case <-ctx.Done():
+			return errResult("context cancelled")
+		}
+	})
+
+	// ── device_info ──────────────────────────────────────────────────────
+	type devArgs struct {
+		Device string `json:"device" jsonschema:"Device serial (optional: serial@endpoint to disambiguate)"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_info",
+		Description: "Read device properties: model, brand, Android version, SDK level, screen size, and battery.",
+	}, func(ctx context.Context, args devArgs) (*mcp.CallToolResult, error) {
+		dev, rec, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		// Probe essentials with one shell batch
+		script := `getprop ro.product.brand; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; dumpsys battery | grep level | tr -dc '0-9'; echo; wm size 2>/dev/null | grep Physical`
+		out, err := dev.RunCommand(script)
+		if err != nil {
+			return errResult("device info probe: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		info := map[string]any{
+			"serial":      rec.Serial,
+			"endpoint":    rec.Endpoint,
+			"endpoint_id": rec.EndpointID,
+			"state":       rec.State,
+		}
+		if len(lines) > 0 {
+			info["brand"] = strings.TrimSpace(lines[0])
+		}
+		if len(lines) > 1 {
+			info["model"] = strings.TrimSpace(lines[1])
+		}
+		if len(lines) > 2 {
+			info["os_version"] = strings.TrimSpace(lines[2])
+		}
+		if len(lines) > 3 {
+			if sdk, e := strconv.Atoi(strings.TrimSpace(lines[3])); e == nil {
+				info["sdk_int"] = sdk
+			}
+		}
+		if len(lines) > 4 {
+			if b, e := strconv.Atoi(strings.TrimSpace(lines[4])); e == nil {
+				info["battery_percent"] = b
+			}
+		}
+		if len(lines) > 5 {
+			info["resolution"] = strings.TrimPrefix(strings.TrimSpace(lines[5]), "Physical size: ")
+		}
+		return textResult(info)
+	})
+
+	// ── device_input ─────────────────────────────────────────────────────
+	type inputArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+		Action string `json:"action" jsonschema:"tap, swipe, text, or key"`
+		X      int    `json:"x,omitempty" jsonschema:"X coordinate for tap"`
+		Y      int    `json:"y,omitempty" jsonschema:"Y coordinate for tap"`
+		X2     int    `json:"x2,omitempty" jsonschema:"End X for swipe"`
+		Y2     int    `json:"y2,omitempty" jsonschema:"End Y for swipe"`
+		Text   string `json:"text,omitempty" jsonschema:"Literal text to type"`
+		Key    string `json:"key,omitempty" jsonschema:"Android keycode name or number (e.g. KEYCODE_HOME, 3, BACK, 4)"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_input",
+		Description: "Inject a touch, swipe, text string, or key event into the device through adb input.",
+	}, func(ctx context.Context, args inputArgs) (*mcp.CallToolResult, error) {
+		dev, _, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		var cmd string
+		switch args.Action {
+		case "tap":
+			cmd = fmt.Sprintf("input tap %d %d", args.X, args.Y)
+		case "swipe":
+			cmd = fmt.Sprintf("input swipe %d %d %d %d 200", args.X, args.Y, args.X2, args.Y2)
+		case "text":
+			// Escape shell metachars
+			escaped := strings.ReplaceAll(args.Text, " ", "%s")
+			cmd = fmt.Sprintf("input text %s", escaped)
+		case "key":
+			cmd = fmt.Sprintf("input keyevent %s", args.Key)
+		default:
+			return errResult("action must be tap, swipe, text, or key (got %q)", args.Action)
+		}
+		out, err := dev.RunCommand(cmd)
+		if err != nil {
+			return errResult("input failed: %v", err)
+		}
+		return textResult(map[string]any{"ok": true, "output": out})
+	})
+
+	// ── device_screenshot ────────────────────────────────────────────────
+	type shotArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_screenshot",
+		Description: "Capture the current screen as a PNG and return it as base64-encoded image data.",
+	}, func(ctx context.Context, args shotArgs) (*mcp.CallToolResult, error) {
+		dev, _, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		conn, err := dev.OpenCommand("screencap", "-p")
+		if err != nil {
+			return errResult("screencap: %v", err)
+		}
+		defer conn.Close()
+		pngBytes, err := io.ReadAll(conn)
+		if err != nil {
+			return errResult("read screenshot: %v", err)
+		}
+		if len(pngBytes) < 8 || string(pngBytes[:8]) != "\x89PNG\r\n\x1a\n" {
+			return errResult("output was not a valid PNG (got %d bytes)", len(pngBytes))
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.ImageContent{
+					Data:     pngBytes,
+					MIMEType: "image/png",
+				},
+				&mcp.TextContent{Text: fmt.Sprintf("captured %d bytes PNG", len(pngBytes))},
+			},
+		}, nil
+	})
+
+	// ── device_forwards ──────────────────────────────────────────────────
+	type fwdListArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_forward_list",
+		Description: "List active port forwards on the device (adb forward --list).",
+	}, func(ctx context.Context, args fwdListArgs) (*mcp.CallToolResult, error) {
+		dev, _, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		pairs, err := dev.ForwardList()
+		if err != nil {
+			return errResult("forward list: %v", err)
+		}
+		return textResult(pairs)
+	})
+
+	type fwdAddArgs struct {
+		Device string `json:"device" jsonschema:"Device serial"`
+		Local  string `json:"local" jsonschema:"Local spec, e.g. tcp:8080"`
+		Remote string `json:"remote" jsonschema:"Remote spec, e.g. tcp:8080 or localabstract:sockname"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_forward",
+		Description: "Create an ADB forward rule (adb forward <local> <remote>).",
+	}, func(ctx context.Context, args fwdAddArgs) (*mcp.CallToolResult, error) {
+		dev, _, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		localSpec, err := parseForwardSpec(args.Local)
+		if err != nil {
+			return errResult("local spec: %v", err)
+		}
+		remoteSpec, err := parseForwardSpec(args.Remote)
+		if err != nil {
+			return errResult("remote spec: %v", err)
+		}
+		if err := dev.Forward(localSpec, remoteSpec); err != nil {
+			return errResult("create forward: %v", err)
+		}
+		return textResult(map[string]any{"ok": true})
+	})
+
+	// ── device_push / device_pull ────────────────────────────────────────
+	type pushArgs struct {
+		Device     string `json:"device" jsonschema:"Device serial"`
+		LocalPath  string `json:"local_path" jsonschema:"Absolute path of local file"`
+		RemotePath string `json:"remote_path" jsonschema:"Absolute path on device filesystem"`
+	}
+	handle(srv, &mcp.Tool{
+		Name:        "device_push",
+		Description: "Push a local file to the device using the native adb sync protocol.",
+	}, func(ctx context.Context, args pushArgs) (*mcp.CallToolResult, error) {
+		dev, _, err := s.mgr.ResolveDevice(args.Device)
+		if err != nil {
+			return errResult("resolve device: %v", err)
+		}
+		f, err := os.Open(args.LocalPath)
+		if err != nil {
+			return errResult("open local file: %v", err)
+		}
+		defer f.Close()
+		stat, err := f.Stat()
+		if err != nil {
+			return errResult("stat local file: %v", err)
+		}
+		w, err := dev.OpenWrite(args.RemotePath, 0644, stat.ModTime())
+		if err != nil {
+			return errResult("open device sync writer: %v", err)
+		}
+		defer w.Close()
+		n, err := io.Copy(w, f)
+		if err != nil {
+			return errResult("push stream broke: %v", err)
+		}
+		return textResult(map[string]any{"ok": true, "bytes_written": n})
+	})
+}
+
+func parseForwardSpec(spec string) (adb.ForwardSpec, error) {
+	parts := strings.SplitN(spec, ":", 2)
+	if len(parts) != 2 {
+		return adb.ForwardSpec{}, fmt.Errorf("spec must be proto:val, got %q", spec)
+	}
+	switch strings.ToLower(parts[0]) {
+	case "tcp":
+		return adb.ForwardSpec{Protocol: adb.FProtocolTcp, PortOrName: parts[1]}, nil
+	case "localabstract":
+		return adb.ForwardSpec{Protocol: adb.FProtocolAbstract, PortOrName: parts[1]}, nil
+	case "localreserved":
+		return adb.ForwardSpec{Protocol: adb.FProtocolReserved, PortOrName: parts[1]}, nil
+	case "localfilesystem":
+		return adb.ForwardSpec{Protocol: adb.FProtocolFilesystem, PortOrName: parts[1]}, nil
+	default:
+		return adb.ForwardSpec{}, fmt.Errorf("unsupported protocol %q", parts[0])
+	}
+}

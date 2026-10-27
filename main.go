@@ -1,10 +1,14 @@
-// adbox-mcp exposes Android devices over MCP by speaking the ADB wire protocol
-// directly, with no dependency on a local adb binary or Android SDK.
+// Package main is the entry point for the adbox-mcp server.
 //
-// The reason it exists: every other Android MCP shells out to `adb`, which can only
-// reach devices attached to the machine it runs on. An endpoint here is a host:port,
-// optionally behind SOCKS5, so a device in a rack, behind NAT, or across an SSH
-// tunnel is addressable with the same tools as one on the desk.
+// WHY ZERO STARTUP FLAGS. An MCP server's configuration belongs in its protocol,
+// not in the argv string of the process manager that launched it. Hardcoding
+// endpoints into the launch command means restarting the server whenever a
+// device rack changes IP, and it prevents an assistant from managing its own
+// network topology.
+//
+// adbox-mcp starts with an empty endpoint registry and exposes endpoints_add,
+// endpoints_remove, and endpoints_list so that callers configure where to look
+// dynamically over stdio.
 package main
 
 import (
@@ -14,34 +18,21 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	"adbox-mcp/internal/endpoint"
 	"adbox-mcp/internal/mcpserver"
 )
 
-type endpointFlags []string
-
-func (e *endpointFlags) String() string     { return strings.Join(*e, "; ") }
-func (e *endpointFlags) Set(v string) error { *e = append(*e, v); return nil }
-
 func main() {
-	var eps endpointFlags
-	flag.Var(&eps, "endpoint", "ADB endpoint: adb=host:port[,name=alias][,proxy=socks5://host:port] (repeatable)")
-	debug := flag.Bool("debug", false, "Enable debug logging")
+	debug := flag.Bool("debug", false, "Enable debug logging to stderr")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `adbox-mcp — MCP server for Android devices over raw ADB endpoints
 
-Usage: adbox-mcp [-endpoint SPEC]... [-debug]
+Usage: adbox-mcp [-debug]
 
-An endpoint is where an adb daemon listens. It may be local, remote, or behind a
-SOCKS5 proxy, which is what lets this reach devices no local adb could see:
-
-  adbox-mcp -endpoint "adb=127.0.0.1:5037,name=desk"
-  adbox-mcp -endpoint "adb=10.0.0.9:5037,name=rack,proxy=socks5://127.0.0.1:11080"
-
-Flags:
+Starts the server on stdio. Endpoints are configured dynamically at runtime
+through the endpoints_add / endpoints_remove tools, so no flags are needed.
 `)
 		flag.PrintDefaults()
 	}
@@ -56,22 +47,6 @@ Flags:
 	})))
 
 	mgr := endpoint.NewManager()
-
-	specs := []string(eps)
-	if len(specs) == 0 {
-		// Default to the conventional local daemon so a plain `adbox-mcp` works
-		// on a developer machine without arguments.
-		specs = []string{"adb=127.0.0.1:5037,name=local"}
-	}
-
-	for _, spec := range specs {
-		id, err := mgr.AddEndpoint(spec)
-		if err != nil {
-			slog.Error("failed to add endpoint", "spec", spec, "err", err)
-			os.Exit(1)
-		}
-		slog.Info("endpoint registered", "spec", spec, "id", id)
-	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

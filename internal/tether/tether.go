@@ -60,6 +60,19 @@ func (m *Manager) Start(device string, port int) (*Session, error) {
 		return existing, nil
 	}
 
+	// One relay serves many devices: TunnelServer keeps a slice of clients and
+	// demultiplexes on the accepted connection, so each device only needs its
+	// own adb reverse mapping, not its own listener. Reuse a relay already
+	// listening on this port instead of failing with EADDRINUSE -- that error
+	// used to abort the caller before it had even created the reverse.
+	for _, s := range m.sessions {
+		if s.Port == port {
+			shared := &Session{Device: device, Port: port, StartedAt: time.Now()}
+			m.sessions[device] = shared
+			return shared, nil
+		}
+	}
+
 	r := relay.NewRelay(port)
 	// Run blocks; the relay is a server. Give it a moment to bind before the
 	// caller goes looking for the port, and let a bind failure surface here

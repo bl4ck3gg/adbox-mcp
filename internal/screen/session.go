@@ -209,14 +209,9 @@ func (s *Session) Start() (webUrl string, err error) {
 	if s.enableVideoSrc {
 		// Video socket. Always first when video is enabled, and the only one that
 		// receives the dummy byte.
-		videoConn, err = s.dev.DialRemote("127.0.0.1", fwdPort)
+		videoConn, err = dialDummy(s.dev, fwdPort, 12*time.Second)
 		if err != nil {
 			return "", fmt.Errorf("dial video socket: %w", err)
-		}
-		dummy := make([]byte, 1)
-		if _, err := io.ReadFull(videoConn, dummy); err != nil {
-			_ = videoConn.Close()
-			return "", fmt.Errorf("read video dummy: %w", err)
 		}
 		go s.readVideoLoop(videoConn)
 	}
@@ -226,14 +221,9 @@ func (s *Session) Start() (webUrl string, err error) {
 	// In control-only mode (video=false, audio=false) there is exactly ONE socket
 	// and it gets the dummy byte because sendDummyByte is once per server run.
 	if !s.enableVideoSrc && !s.enableAudioSrc {
-		control, err := s.dev.DialRemote("127.0.0.1", fwdPort)
+		control, err := dialDummy(s.dev, fwdPort, 12*time.Second)
 		if err != nil {
 			return "", fmt.Errorf("dial control-only socket: %w", err)
-		}
-		dummy := make([]byte, 1)
-		if _, err := io.ReadFull(control, dummy); err != nil {
-			_ = control.Close()
-			return "", fmt.Errorf("read control-only dummy: %w", err)
 		}
 		s.controlConn.Store(&control)
 		go s.readControlLoop(control)
@@ -241,67 +231,43 @@ func (s *Session) Start() (webUrl string, err error) {
 		return "", nil // no web viewer URL; caller gets pure control
 	}
 	//
-	// The server accepts video, then optionally audio, then control, so after the
-	// video socket the next connections are (audio?, control). Whether audio
-	// exists depends on the build and the API level, and guessing from either is
-	// how a wrong assumption turns into "sockets connect but nothing streams".
+	// The server accepts sockets in a fixed order that the launch flags decide:
+	// video, then audio when audio=true, then control. DesktopConnection.open
+	// accepts exactly as many as the flags promise and writes the dummy byte on
+	// the first one, so the layout is known and there is nothing to probe.
 	//
-	// Probe instead: send a clipboard request on each candidate and see which one
-	// answers. It is idempotent, tiny, and harmless if it lands on the audio
-	// socket (whose input the server never reads). Enable-video is NOT safe to
-	// probe with -- writing it into the audio slot corrupts the audio stream and
-	// the encoder never starts.
-	first := mustDial(s.dev, fwdPort)
-	if first == nil {
-		_ = videoConn.Close()
-		return "", fmt.Errorf("dial control candidate 1")
-	}
-	second := mustDial(s.dev, fwdPort)
-	if second == nil {
-		_ = videoConn.Close()
-		_ = first.Close()
-		return "", fmt.Errorf("dial control candidate 2")
-	}
-
-	reply := make(chan net.Conn, 2)
-	s.probeReply = reply
-	go s.readControlLoop(first)
-	go s.readControlLoop(second)
-
-	// SetClipboard with sequence != 0 produces an ACK_CLIPBOARD device message
-	// unconditionally (GetClipboard returns nothing when autosync is on). The
-	// audio socket accepts no control frames and will never answer.
-	probePkt := SetClipboard(1, "", false)
-	_, _ = first.Write(probePkt)
-	_, _ = second.Write(probePkt)
-
-	var control net.Conn
-	select {
-	case control = <-reply:
-	case <-time.After(1500 * time.Millisecond):
-	}
-
-	if control == nil {
-		// Neither answered. That happens when the server accepted fewer sockets
-		// than we dialed and one candidate is parked in the backlog, or when the
-		// clipboard path is unavailable on this build. Fall back to the layout
-		// scrcpy uses when audio is off: the first candidate is control.
-		slog.Warn("screen: no clipboard reply, assuming two-socket layout", "device", s.serial)
-		control = first
-		_ = second.Close()
-		s.audioActive.Store(false)
-	} else if control == first {
-		slog.Info("screen: audio unavailable (two sockets)", "device", s.serial)
-		_ = second.Close()
-		s.audioActive.Store(false)
-	} else {
-		slog.Info("screen: audio active (three sockets)", "device", s.serial)
+	// Dialing a spare candidate "just in case" is what used to break this: the
+	// extra connection parks in the listen backlog, the accept order stops
+	// matching the order we dialed, and the control stream lands on the wrong
+	// socket and dies.
+	var audioConn net.Conn
+	if s.enableAudioSrc {
+		audioConn = mustDial(s.dev, fwdPort)
+		if audioConn == nil {
+			if videoConn != nil {
+				_ = videoConn.Close()
+			}
+			return "", fmt.Errorf("dial audio socket")
+		}
+		s.audioConn.Store(&audioConn)
 		s.audioActive.Store(true)
-		s.audioConn.Store(&first)
-		go s.readAudioLoop(first)
+		go s.readAudioLoop(audioConn)
+		slog.Info("screen: three-socket layout (video, audio, control)", "device", s.serial)
+	} else {
+		s.audioActive.Store(false)
+		slog.Info("screen: two-socket layout (video, control)", "device", s.serial)
 	}
 
-	s.probeReply = nil
+	control := mustDial(s.dev, fwdPort)
+	if control == nil {
+		if audioConn != nil {
+			_ = audioConn.Close()
+		}
+		if videoConn != nil {
+			_ = videoConn.Close()
+		}
+		return "", fmt.Errorf("dial control socket")
+	}
 	s.controlConn.Store(&control)
 
 	// Enable video now that the control channel is known.
@@ -892,6 +858,40 @@ func mustDial(dev *adb.Device, port int) net.Conn {
 		return nil
 	}
 	return c
+}
+
+// dialDummy connects to the forwarded socket and consumes the server's dummy
+// byte, retrying until the deadline.
+//
+// The server is an app_process child. On a cold ART start it is not listening
+// yet when the forward is created, and adb answers a connection to a socket
+// that does not exist with an immediate EOF rather than a refusal 鈥?so a single
+// attempt fails the whole mirror on any device slow enough to lose the race,
+// which is most of them. Retry the pair (connect, read one byte) until the
+// server is actually up.
+func dialDummy(dev *adb.Device, port int, timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		c, err := dev.DialRemote("127.0.0.1", port)
+		if err == nil {
+			_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+			buf := make([]byte, 1)
+			if _, err = io.ReadFull(c, buf); err == nil {
+				_ = c.SetReadDeadline(time.Time{})
+				return c, nil
+			}
+			_ = c.Close()
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("timeout after %s", timeout)
+			}
+			return nil, lastErr
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // SetAudioEnabled dynamically toggles audio encoding via control message 19.
